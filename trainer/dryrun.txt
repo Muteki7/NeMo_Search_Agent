@@ -1,0 +1,1 @@
+error: No virtual environment or system Python installation found for path `trainer/.venv-train/bin/activate`; run `uv venv` to create an environment
