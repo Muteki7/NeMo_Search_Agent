@@ -26,6 +26,7 @@ CALL_LOG = {"generate_calls": 0, "lora_requests": 0, "batch_sizes": []}
 #Add logs
 ROLLOUT_LOG = [] #one dict per rollout_func call
 VIOLATIONS = {"prefix": 0, "len_mismatch": 0, "env_lp_nonzero": 0, "gen_lp_positive": 0}
+PREFIX_DETAILS = []  # what differed when re-rendering the conversation did not reproduce the previous token ids
 
 #Module level logs
 
@@ -155,6 +156,7 @@ def make_rollout_func():
         mask = [[] for _ in range(n)]
         gen_count = [0] * n #Tokens the vLLM actually generated
         prev_ids = [list(x) for x in p_ids]
+        TURN1_FINISH = [None] * n   # why turn 1 stopped ("stop" = EOS, "length" = hit max_tokens)
 
         for turn in range(MAX_TURNS):
             texts = [tok.apply_chat_template(c, add_generation_prompt=True, tokenize=False) for c in convs]
@@ -166,6 +168,9 @@ def make_rollout_func():
             for i, out in enumerate(outs):
                 o = out.outputs[0]
                 gen_ids = list(o.token_ids)
+                if turn == 0:
+                    #Storing Turn1's finish reason
+                    TURN1_FINISH[i] = o.finish_reason
                 gen_count[i]+=len(gen_ids)
                 gen_lp = [
                     list(d.values())[0].logprob if d else 0.0
@@ -177,9 +182,23 @@ def make_rollout_func():
                 """
                 For multi-turn generation it checks if the new tokens are being properly appened without
                 changing the prefix tokens
+                
+                prev_ids[i]: The token IDs of conversation up to previous turn
+                full_prompt_ids: The token IDs of current conversation with the appended generated tokens
+                if the prefix of full_prompt_ids and prev_ids[i] doesn't match then our rollout_func is not properly appending the new tokens
+                this can cause the policy to be slightly off-policy.
                 """
                 if turn>0 and full_prompt_ids[:len(prev_ids[i])] != prev_ids[i]:
                     VIOLATIONS["prefix"] +=1
+                    #We find the first position where the two tokens differ and log the surrounding tokens for debugging
+                    _j = next((k for k, (a, b) in enumerate(zip(full_prompt_ids, prev_ids[i])) if a != b),
+                              min(len(full_prompt_ids), len(prev_ids[i])))
+                    PREFIX_DETAILS.append({
+                        "first_diff": _j, "len_prev": len(prev_ids[i]), "len_new": len(full_prompt_ids),
+                        "prev_tokens": tok.convert_ids_to_tokens(prev_ids[i][max(0, _j - 4):_j + 4]),
+                        "new_tokens": tok.convert_ids_to_tokens(full_prompt_ids[max(0, _j - 4):_j + 4]),
+                        "turn1_finish": TURN1_FINISH[i],
+                    })
 
                 env_ids = full_prompt_ids[len(prev_ids[i]):] if turn > 0 else []
                 comp[i] += env_ids + gen_ids
@@ -278,6 +297,28 @@ RESULTS["b_single_engine"] = reuses and (vram_after_trainer - vram_after_load) <
 
 #c1 before training
 b_before = lora_b_abs_sum(trainer.model)
+
+"""
+d6 spy: record the surviving-token count before/after the env_mask (tool_mask) is multiplied into the
+completion_mask inside the compiled trainer's loss path. If after < before, env tokens are zeroed in the loss.
+Patch the module that defines the trainer class (grpo_accumulated_loss looks the function up in that module's globals).
+"""
+import sys
+_trainer_mod = sys.modules[type(trainer).__module__]
+if not hasattr(_trainer_mod, "align_completion_tool_mask"):
+    _trainer_mod = next(m for k, m in sys.modules.items()
+                        if k.endswith("UnslothGRPOTrainer") and hasattr(m, "align_completion_tool_mask"))
+_orig_align = _trainer_mod.align_completion_tool_mask
+LOSS_MASK = []   # (tokens before env_mask, tokens after env_mask) per call
+
+def _spy_align(tool_mask, completion_mask):
+    out = _orig_align(tool_mask, completion_mask)
+    if tool_mask is not None:
+        LOSS_MASK.append((int(completion_mask.sum()), int(out.sum())))
+    return out
+
+_trainer_mod.align_completion_tool_mask = _spy_align
+
 trainer.train()
 
 #c1,c2,c3 after training
@@ -406,9 +447,20 @@ RESULTS["d4_metric_matches_mask"] = (
 RESULTS["d5_grouping"] = bool(ROLLOUT_LOG) and all(
     r["groups_ok"] and r["n_groups"] >= 2 and r["n"] == r["n_groups"] * NUM_GEN for r in ROLLOUT_LOG)
 
+
+#d6: env tokens are actually zeroed in the loss (surviving-token count drops after the env_mask is applied)
+RESULTS["d6_env_zeroed_in_loss"] = bool(LOSS_MASK) and all(after < before for before, after in LOSS_MASK)
+_tot_before = sum(b for b, _ in LOSS_MASK)
+_tot_after = sum(a for _, a in LOSS_MASK)
+print(f"[spike] (d6) calls={len(LOSS_MASK)} (before, after)={LOSS_MASK}; totals before={_tot_before} after={_tot_after}")
+print(f"[spike] (d6) rollout totals: raw tokens={sum(r['mean_len'] * r['n'] for r in ROLLOUT_LOG):.0f} "
+      f"generated tokens={sum(r['mean_gen'] * r['n'] for r in ROLLOUT_LOG):.0f}")
+
 print(f"[spike] (d) violations={VIOLATIONS}; logged mean_length={logged}; mask-sum means={[round(r['mean_gen'],2) for r in ROLLOUT_LOG]}; raw means={[round(r['mean_len'], 2) for r in ROLLOUT_LOG]}")
 print("[spike] (d) mask==0 text (env):", repr(ROLLOUT_LOG[0]["env_text"]))
 print("[spike] (d) mask==1 text (model):", repr(ROLLOUT_LOG[0]["gen_text"]))
+print("[spike] (d3) prefix violation details:", PREFIX_DETAILS)
+
 # # (d) grouping + env_mask reflected in completions/mean_length
 # hist = [h for h in trainer.state.log_history if "completions/mean_length" in h]
 # ml = hist[0]["completions/mean_length"] if hist else None
