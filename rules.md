@@ -16,6 +16,19 @@ The keyword is spelled exactly `DELIBERATE_PRACTICE` Match it exactly.
 
 **When the keyword does not appear anywhere in the chat:** act normally. Make the changes and implementations yourself, the way you normally would.
 
+## DELIBERATE_PRACTICE_v0
+
+The keyword is spelled exactly `DELIBERATE_PRACTICE_v0`. Match it exactly. Because it contains `DELIBERATE_PRACTICE`, it takes precedence: if `DELIBERATE_PRACTICE_v0` appears, follow this section.
+
+**Purpose:** same as `DELIBERATE_PRACTICE` (the user writes the code changes themselves), but with a worked example of each change.
+
+**When the keyword appears in the chat:**
+- Everything from `DELIBERATE_PRACTICE` still applies: do not edit or write project files, do not install or change packages, give clear step-by-step guidance on what to change and where, and read-only commands are fine.
+- In addition, for each change, give a small code chunk that is representative of the change. It should show the shape of what to write, so the user can adapt it and place it themselves.
+- Keep each chunk short and tied to a specific step, with its location (file and line area) stated next to it.
+
+**Tier summary:** `DELIBERATE_PRACTICE` = steps only. `DELIBERATE_PRACTICE_v0` = steps plus representative code chunks. No keyword = Claude makes the changes.
+
 ## Future
 
 This state may later get tiers, where the tier sets how much help Claude gives. For now there is one simple state: keyword present means guide only, keyword absent means act normally.

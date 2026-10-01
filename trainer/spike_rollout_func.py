@@ -21,9 +21,77 @@ NUM_GEN = 4
 MAX_TURNS = 2
 MAX_NEW = 64
 LORA_NAME = "grpo_trainer_lora_model"
-
 RESULTS = {}
 CALL_LOG = {"generate_calls": 0, "lora_requests": 0, "batch_sizes": []}
+#Add logs
+ROLLOUT_LOG = [] #one dict per rollout_func call
+VIOLATIONS = {"prefix": 0, "len_mismatch": 0, "env_lp_nonzero": 0, "gen_lp_positive": 0}
+
+#Module level logs
+
+LORA_IDS = [] #lora_int_id seen by each rollout_func call
+
+def lora_b_abs_sum(m):
+    with torch.no_grad():
+        """
+        This process helps us monitor LoRA Magnitude: To track how much weight/magnitude the LoRA B matrices are
+        accumulating
+        
+        for loop iterates through all trainable parameters in model m and filters specifically for 
+        parameters who's name is lora_B
+
+        p.detach(): Disables gradient tracking
+        
+        float(): converts parameters to 32-bit floating point precision (FP32) to prevent over/underflow
+        if training was done in F16 or BF16
+        
+        abs().sum().item(): Takes abs value of every element and sums them up and converts the single-element
+        
+        PyTorch tensor to a standard Python number.
+        return sum(..): sums abs values across all matched lora_B and returns a single floating-point number
+        """
+        return sum(p.detach().float().abs().sum().item() 
+                   for n, p in m.named_parameters() if "lora_B" in n)
+
+def fill_lora_b(m, seed, std=0.02):
+    """
+    We are essentially adding gaussian noise to LoRA B matrices.
+    Now LoRA adaption is computed as $\nabal{W} = BxA$ generally B is initialized to 0 so the step 0 outputs are 100% identical
+    to the base model. Since we are adding noise here that will break, so this is a test to see if LoRA adapter is even working.
+
+    g=torch.Gen.. : Creates a deterministic CPU random num generator locked to seed
+
+    with torch._no_grad(): Disables autograd gradient tracking so PyTorch allows directly modifying parameter values in-place
+    
+    for loop: finding every parameter tensor that belogns to LoRA B matrix
+
+    p.copy_(...) : Overwrites existing values of parameters in-place with:
+        torch.randn(..)*std: Draws values from the normal distribution with mean 0 and std (default to 0.22)
+        .to(device=..): Ensures generated values match parameter's target GPU/CPU device and data type (F16, BF16, FP32)
+    """
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    with torch.no_grad():
+        for n, p in m.named_parameters():
+            if "lora_B" in n:
+                p.copy_((torch.randn(p.shape, generator=g) * std).to(device=p.device, dtype=p.dtype))
+
+def greedy_ids(eng, text, lora_request):
+    """
+    Checking if our LoRA adapter is able to output tokens
+
+    sp0 = SamplingParams(..): 
+        temperature=0.0: Forces Greedy Decoding (pick highes probability token, making output 100% deterministic)
+        max_tokens=32 : Limits generated output length to at most 32 tokens
+    
+        out = eng.generated(..): Passes hte prompt text into the inference engine (eng), applying specified dynamic
+        LoRA adapter (lora_request) to process the request.
+
+        return list(..): Extracts an array of generated token ID integers([1024, 882, 319..]) from first completion
+        sequence of response objects and converts it to standard python list
+    """
+    sp0 = SamplingParams(temperature=0.0, max_tokens=32)
+    out = eng.generate([text], sp0, use_tqdm=False, lora_request=lora_request)
+    return list(out[0].outputs[0].token_ids)
 
 
 def vram_used_mib():
@@ -63,9 +131,20 @@ def make_rollout_func():
         tok = trainer.processing_class
         eng = trainer.model.vllm_engine
         lora = trainer.model.load_lora(LORA_NAME, load_tensors=True)
+        #Logging the adapter ID
+        LORA_IDS.append(lora.lora_int_id)
         sp = SamplingParams(temperature=0.9, top_p=0.95, max_tokens=MAX_NEW, logprobs=0)
 
         n = len(prompts)
+
+        #Group checking
+        """
+        Since we use GRPO we check and calculate our advantage function with respect to the group of completion prompts
+        This checks if the incoming prompts are structure in groups
+        """
+        groups_ok = all(prompts[j] == prompts[(j // NUM_GEN) * NUM_GEN] for j in range(n))
+        n_groups = len({json.dumps(p) for p in prompts})
+
         convs = [list(m) for m in prompts]
         p_ids = []
         for m in prompts:
@@ -74,6 +153,7 @@ def make_rollout_func():
         comp = [[] for _ in range(n)]
         lps = [[] for _ in range(n)]
         mask = [[] for _ in range(n)]
+        gen_count = [0] * n #Tokens the vLLM actually generated
         prev_ids = [list(x) for x in p_ids]
 
         for turn in range(MAX_TURNS):
@@ -86,12 +166,21 @@ def make_rollout_func():
             for i, out in enumerate(outs):
                 o = out.outputs[0]
                 gen_ids = list(o.token_ids)
+                gen_count[i]+=len(gen_ids)
                 gen_lp = [
                     list(d.values())[0].logprob if d else 0.0
                     for d in (o.logprobs or [None] * len(gen_ids))
                 ]
                 # env tokens = template/tool tokens between previous_ids and this generation
                 full_prompt_ids = tok(texts[i], add_special_tokens=False)["input_ids"]
+
+                """
+                For multi-turn generation it checks if the new tokens are being properly appened without
+                changing the prefix tokens
+                """
+                if turn>0 and full_prompt_ids[:len(prev_ids[i])] != prev_ids[i]:
+                    VIOLATIONS["prefix"] +=1
+
                 env_ids = full_prompt_ids[len(prev_ids[i]):] if turn > 0 else []
                 comp[i] += env_ids + gen_ids
                 lps[i] += [0.0] * len(env_ids) + gen_lp
@@ -101,6 +190,32 @@ def make_rollout_func():
                 if turn < MAX_TURNS - 1:
                     convs[i].append({"role": "user", "content": echo_tool(o.text[:40])})
 
+        #Alignment, logprob and sample checks
+        """
+        comp: Completion tokens
+        mask: loss mask
+        lps: log-probabilities
+
+        We ensure that these are all strictly equal
+        """
+        for i in range(n):
+            if not (len(comp[i])==len(mask[i])==len(lps[i])):
+                VIOLATIONS["len_mismatch"] +=1
+
+            """Ensuring that the environment tokens don't contribute to the log_probs"""
+            VIOLATIONS["env_lp_nonzero"] += sum(1 for m, lp in zip(mask[i], lps[i]) if m==0 and lp!=0.0)
+            
+            """Ensuring generated tokens have non-zero log probabilites"""
+            VIOLATIONS["gen_lp_positive"] += sum(1 for m, lp in zip(mask[i], lps[i]) if m==1 and lp>0.0)
+        ROLLOUT_LOG.append({
+            "n": n, "groups_ok": groups_ok, "n_groups": n_groups,
+            "mean_len": sum(len(c) for c in comp) / n,
+            "mean_gen": sum(sum(m) for m in mask) / n,
+            "min_env": min(len(m)-sum(m) for m in mask),
+            "env_text": tok.decode([t for t, m in zip(comp[0], mask[0]) if m == 0]),
+            "gen_text": tok.decode([t for t, m in zip(comp[0], mask[0]) if m == 1]),
+            "gen_count_ok" : all(sum(mask[i])==gen_count[i] for i in range(n)),
+        })
         return {
             "prompt_ids": p_ids,
             "completion_ids": comp,
@@ -124,11 +239,11 @@ dataset = Dataset.from_list(
 cfg = GRPOConfig(
     output_dir="spike_out",
     max_steps=2,
-    per_device_train_batch_size=NUM_GEN,
+    per_device_train_batch_size= 2*NUM_GEN, #2 unique prompts repeats per rollout call
     gradient_accumulation_steps=1,
     num_generations=NUM_GEN,
     max_completion_length=MAX_TURNS * MAX_NEW + 128,
-    learning_rate=5e-6,
+    learning_rate=1e-4, #Making training move the adapter more
     logging_steps=1,
     report_to="none",
     save_strategy="no",
@@ -161,20 +276,148 @@ print(f"[spike] (b) trainer.llm is model.vllm_engine: {llm_attr is model.vllm_en
 print(f"[spike] (b) VRAM load={vram_after_load} MiB, after trainer init={vram_after_trainer} MiB")
 RESULTS["b_single_engine"] = reuses and (vram_after_trainer - vram_after_load) < 2000
 
+#c1 before training
+b_before = lora_b_abs_sum(trainer.model)
 trainer.train()
 
-RESULTS["c_lora_used_in_rollout"] = CALL_LOG["generate_calls"] > 0 and CALL_LOG["lora_requests"] == CALL_LOG["generate_calls"]
-print(f"[spike] (c) generate calls={CALL_LOG['generate_calls']}, with lora_request={CALL_LOG['lora_requests']}")
+#c1,c2,c3 after training
 
-# (d) grouping + env_mask reflected in completions/mean_length
-hist = [h for h in trainer.state.log_history if "completions/mean_length" in h]
-ml = hist[0]["completions/mean_length"] if hist else None
-# Every completion has MAX_TURNS generations of <= MAX_NEW tokens plus env tokens; with env_mask the
-# logged length counts only generated tokens, so it must be <= MAX_TURNS*MAX_NEW.
-RESULTS["d_env_mask_and_grouping"] = ml is not None and ml <= MAX_TURNS * MAX_NEW and all(
-    b % NUM_GEN == 0 for b in CALL_LOG["batch_sizes"]
+"""
+c0 & c1: Verifying LoRA Weight Mutation
+ c0: Assets taht every single generation request during rollout passsed an active lora_request
+ c1: Confirms that the initial LoRA B matrix was zero (<1e-9) and after initialzing and training
+ it become non-zero (>0.0) indicating that our LoRA adapter is working 
+"""
+
+b_after=lora_b_abs_sum(trainer.model)
+RESULTS["c0_lora_attached_each_call"] = (
+    CALL_LOG["generate_calls"] > 0 and CALL_LOG["lora_requests"] == CALL_LOG["generate_calls"])
+
+RESULTS["c1_adapter_updated"] = b_before <1e-9 and b_after > 0.0
+print(f"[spike] (c1) sum|lora_b| before={b_before:.3e} after={b_after:.3e}")
+
+eng = trainer.model.vllm_engine
+prompt_text = tokenizer.apply_chat_template(
+    [{"role": "user", "content": "Say something about number 3."}],
+    add_generation_prompt=True, tokenize=False)
+
+"""
+Testing Base model control
+We are generate requests from base mode twice lora_request=None (greedy_ids)
+verify deterministic greedy output => base_a==base_b
+"""
+
+base_a=greedy_ids(eng, prompt_text, None)
+base_b=greedy_ids(eng, prompt_text, None)
+
+"""
+Testing Hot-swapping & live adapter influence (c2)
+fill_lora_b(..): Manually adding Gaussian noise to Matrix B
+
+trainer.model.load_lora: Reloading tensors with this added noise
+
+c2_live_adapter..: Asserts that attaching lora1 changes the model's output tokens, proving that the
+adapter is working 
+"""
+fill_lora_b(trainer.model, seed=1)
+lora1 = trainer.model.load_lora(LORA_NAME, load_tensors=True)
+out1 = greedy_ids(eng, prompt_text, lora1)
+out1_again = greedy_ids(eng, prompt_text, lora1)
+
+fill_lora_b(trainer.model, seed=2)
+lora2 = trainer.model.load_lora(LORA_NAME, load_tensors=True)
+out2= greedy_ids(eng, prompt_text, lora2)
+
+RESULTS["c2_live_adapter_changes_output"] = base_a == base_b and out1 !=base_a
+
+"""
+c3: Guarding Against Caching & Stale-Adapter bugs
+Engine implementations like vLLM uses LRU caches for dynamic LoRA adapters, if the engine caches adapater
+by name/ID then even after updating weights under LORA_NAME in-place might cause inference to use old cached
+adapter instead of fetching the updated weights
+
+Generates lora1 output twice to confirm that it is stable
+
+We then again generate lora2 and out2 and prove that lora2 produces a different output sequence to lora1 (out2!=out1)
+This shows that cache is updated
+
+lora2.lora_int_id > lora1...: Force vLLM to treat update as a fresh adapter instance.
+"""
+RESULTS["c3_no_stale_adapter"] = (
+    out1==out1_again and out2 != out1 and lora2.lora_int_id > lora1.lora_int_id
+    and LORA_IDS==sorted(set(LORA_IDS)) 
 )
-print(f"[spike] (d) completions/mean_length={ml} (cap {MAX_TURNS * MAX_NEW}); batch_sizes={CALL_LOG['batch_sizes'][:4]}")
+
+print(f"[spike] (c) lora ids in rollouts={LORA_IDS}; out1!=base={out1!=base_a}; out2!=out1={out2 != out1}")
+
+
+#Before i test d
+"""
+TRL's in-built log checker to see completion token lenghts, idea is we want to compare that with our rollout token length
+Since our custom rollout is properly masked (d2 test passed, env tokens are not added), properly appending without messing
+up our prefix tokens (d3 pass), but we are failing up with the token matching for TRL vs Custom rollouts
+"""
+logged = [h["completions/mean_length"] for h in trainer.state.log_history if "completions/mean_length" in h]
+RESULTS["d1_alignment"] = (VIOLATIONS["len_mismatch"]==0 and VIOLATIONS["env_lp_nonzero"]==0 and VIOLATIONS["gen_lp_positive"] == 0)
+
+RESULTS["d2_env_tokens_present"] = bool(ROLLOUT_LOG) and all(r["min_env"] > 0 for r in ROLLOUT_LOG)
+
+RESULTS["d3_prefix_preserving"] = VIOLATIONS["prefix"] == 0
+
+"""
+Dealing with d4 test failing we have a couple options:
+len(logged) == len(ROLLOUT_LOG): To ensure TRL and Custom worker are logged 1-to-1 lockstep
+
+abs(1-r["mean_gen"] < 1e-3): This is to check that our custom worker generated atleast ~1.0 tokens
+
+l<r["mean_len"]: Important check to ensure that TRL is isolating environment tokens from policy updates
+"""
+
+"""
+Checking where the failure point is by breaking down d4 check
+"""
+RESULTS["d4a_log_step_sync"] = (len(logged) == len(ROLLOUT_LOG))
+
+if RESULTS["d4a_log_step_sync"]:
+    #Rollout Drift check: Did our custom rollout generator drift from expected tokens generated
+    RESULTS["d4b_mask_sum_matches_vllm_counts"] = all(
+    r["gen_count_ok"] and 1 <= r["mean_gen"] <= MAX_TURNS * MAX_NEW for r in ROLLOUT_LOG)
+
+    #if l>r["mean_gen"] then TRL is counting ENV/Prompt tokens as well
+    #This reveals if TRL token is matching exactly to only model-generated tokens
+    RESULTS["d4c_trl_mask_exact_match"] = all(
+        abs(l-r["mean_gen"]) < 1e-3 for l,r in zip(logged, ROLLOUT_LOG) 
+    )
+
+    #Here true means TRL logged length is strictly below raw length
+    RESULTS["d4d_trl_excludes_env_tokens"] = all(
+    l < r["mean_len"] for l, r in zip(logged, ROLLOUT_LOG))
+
+else:
+    RESULTS["d4b_rollout_drift"]=False
+    RESULTS["d4c_trl_mask_exact_match"]=False
+    RESULTS["d4d_trl_includes_env_tokens"]=False
+
+RESULTS["d4_metric_matches_mask"] = (
+    RESULTS["d4a_log_step_sync"] and RESULTS["d4c_trl_mask_exact_match"]
+    and RESULTS["d4d_trl_excludes_env_tokens"]
+)
+
+RESULTS["d5_grouping"] = bool(ROLLOUT_LOG) and all(
+    r["groups_ok"] and r["n_groups"] >= 2 and r["n"] == r["n_groups"] * NUM_GEN for r in ROLLOUT_LOG)
+
+print(f"[spike] (d) violations={VIOLATIONS}; logged mean_length={logged}; mask-sum means={[round(r['mean_gen'],2) for r in ROLLOUT_LOG]}; raw means={[round(r['mean_len'], 2) for r in ROLLOUT_LOG]}")
+print("[spike] (d) mask==0 text (env):", repr(ROLLOUT_LOG[0]["env_text"]))
+print("[spike] (d) mask==1 text (model):", repr(ROLLOUT_LOG[0]["gen_text"]))
+# # (d) grouping + env_mask reflected in completions/mean_length
+# hist = [h for h in trainer.state.log_history if "completions/mean_length" in h]
+# ml = hist[0]["completions/mean_length"] if hist else None
+# # Every completion has MAX_TURNS generations of <= MAX_NEW tokens plus env tokens; with env_mask the
+# # logged length counts only generated tokens, so it must be <= MAX_TURNS*MAX_NEW.
+# RESULTS["d_env_mask_and_grouping"] = ml is not None and ml <= MAX_TURNS * MAX_NEW and all(
+#     b % NUM_GEN == 0 for b in CALL_LOG["batch_sizes"]
+# )
+# print(f"[spike] (d) completions/mean_length={ml} (cap {MAX_TURNS * MAX_NEW}); batch_sizes={CALL_LOG['batch_sizes'][:4]}")
 
 print("\n===== GATE 1 RESULTS =====")
 for k, v in RESULTS.items():
