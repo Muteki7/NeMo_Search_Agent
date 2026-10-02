@@ -37,11 +37,11 @@
   "revision": null,
   "target_modules": [
     "o_proj",
-    "k_proj",
-    "down_proj",
-    "q_proj",
-    "gate_proj",
     "v_proj",
+    "gate_proj",
+    "k_proj",
+    "q_proj",
+    "down_proj",
     "up_proj"
   ],
   "target_parameters": null,

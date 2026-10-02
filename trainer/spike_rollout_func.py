@@ -19,14 +19,14 @@ from vllm import SamplingParams  # noqa: E402
 MODEL = "unsloth/Llama-3.2-1B-Instruct"
 NUM_GEN = 4
 MAX_TURNS = 2
-MAX_NEW = 64
+MAX_NEW = 256
 LORA_NAME = "grpo_trainer_lora_model"
 RESULTS = {}
 CALL_LOG = {"generate_calls": 0, "lora_requests": 0, "batch_sizes": []}
 #Add logs
 ROLLOUT_LOG = [] #one dict per rollout_func call
-VIOLATIONS = {"prefix": 0, "len_mismatch": 0, "env_lp_nonzero": 0, "gen_lp_positive": 0}
-PREFIX_DETAILS = []  # what differed when re-rendering the conversation did not reproduce the previous token ids
+VIOLATIONS = {"len_mismatch": 0, "env_lp_nonzero": 0, "gen_lp_positive": 0,
+              "ctx_mismatch": 0, "vllm_prompt_mismatch": 0, "rerender_differs": 0}
 
 #Module level logs
 
@@ -125,6 +125,27 @@ def echo_tool(text: str) -> str:
     return f"ECHO: {text}"
 
 
+# ---- TITO helpers (see the HF "TITO" post): the buffer of sampled ids is the source of truth; never re-encode ----
+TOOL_ROLE = "ipython"   # Llama 3.x role for tool output (the template JSON-quotes string content)
+_DUMMY = [{"role": "user", "content": "dummy"}, {"role": "assistant", "content": "dummy"}]
+
+
+def tool_delta_ids(tok, role, text):
+    """Ids to append after a sampled assistant turn: the tool message + the opening of the next assistant turn.
+    Template-diff delta: render a dummy conversation with and without the tool message, subtract by ids."""
+    prefix = tok.apply_chat_template(_DUMMY, tokenize=True, return_dict=False)
+    full = tok.apply_chat_template(_DUMMY + [{"role": role, "content": text}],
+                                   tokenize=True, return_dict=False, add_generation_prompt=True)
+    assert full[:len(prefix)] == prefix, f"chat template is not prefix-preserving for role={role!r}"
+    return list(full[len(prefix):])
+
+
+# startup property check: appending a tool message must extend the render token-for-token (raises if not)
+_probe_delta = tool_delta_ids(tokenizer, TOOL_ROLE, "dummy")
+RESULTS["d3c_template_prefix_preserving"] = True
+print(f"[spike] (d3c) template is prefix-preserving for role={TOOL_ROLE!r}; delta = {tokenizer.decode(_probe_delta)!r}")
+
+
 def make_rollout_func():
     def rollout_func(prompts, trainer):
         """TRL passes prompts ALREADY repeated num_generations times (one entry per completion),
@@ -146,68 +167,71 @@ def make_rollout_func():
         groups_ok = all(prompts[j] == prompts[(j // NUM_GEN) * NUM_GEN] for j in range(n))
         n_groups = len({json.dumps(p) for p in prompts})
 
-        convs = [list(m) for m in prompts]
-        p_ids = []
-        for m in prompts:
-            ids = tok.apply_chat_template(m, add_generation_prompt=True, tokenize=True)
-            p_ids.append(list(ids["input_ids"] if isinstance(ids, dict) else ids))
+        convs = [list(m) for m in prompts]      # message bookkeeping, ONLY for the informational re-render counter
+        p_ids = [list(tok.apply_chat_template(m, add_generation_prompt=True, tokenize=True, return_dict=False))
+                 for m in prompts]
         comp = [[] for _ in range(n)]
         lps = [[] for _ in range(n)]
         mask = [[] for _ in range(n)]
         gen_count = [0] * n #Tokens the vLLM actually generated
-        prev_ids = [list(x) for x in p_ids]
-        TURN1_FINISH = [None] * n   # why turn 1 stopped ("stop" = EOS, "length" = hit max_tokens)
+        ctx_ids = [list(x) for x in p_ids]      # TITO buffer: exactly what vLLM sees; never re-encoded from text
+        last_sent = [None] * n                  # prompt ids sent on each trajectory's last turn
+        last_gen = [None] * n                   # tokens generated on each trajectory's last turn
+        active = [True] * n                     # trajectories still running
+        continued = [False] * n                 # trajectories that received a tool message
+        truncated = [False] * n                 # trajectories that ended by hitting max_tokens
 
         for turn in range(MAX_TURNS):
-            texts = [tok.apply_chat_template(c, add_generation_prompt=True, tokenize=False) for c in convs]
+            idx = [i for i in range(n) if active[i]]
+            if not idx:
+                break
+            sent = {i: list(ctx_ids[i]) for i in idx}
+            if turn > 0:
+                # informational only: would the OLD approach (re-render the messages) have given the same ids?
+                for i in idx:
+                    rr = tok.apply_chat_template(convs[i], add_generation_prompt=True, tokenize=True, return_dict=False)
+                    if list(rr) != ctx_ids[i]:
+                        VIOLATIONS["rerender_differs"] += 1
             CALL_LOG["generate_calls"] += 1
-            CALL_LOG["batch_sizes"].append(len(texts))
-            outs = eng.generate(texts, sp, use_tqdm=False, lora_request=lora)
+            CALL_LOG["batch_sizes"].append(len(idx))
+            # token-in: prompts are sent as ids, so vLLM never re-tokenizes text
+            outs = eng.generate([{"prompt_token_ids": sent[i]} for i in idx], sp, use_tqdm=False, lora_request=lora)
             if lora is not None:
                 CALL_LOG["lora_requests"] += 1
-            for i, out in enumerate(outs):
+            for i, out in zip(idx, outs):
                 o = out.outputs[0]
                 gen_ids = list(o.token_ids)
-                if turn == 0:
-                    #Storing Turn1's finish reason
-                    TURN1_FINISH[i] = o.finish_reason
-                gen_count[i]+=len(gen_ids)
+                gen_count[i] += len(gen_ids)
                 gen_lp = [
                     list(d.values())[0].logprob if d else 0.0
                     for d in (o.logprobs or [None] * len(gen_ids))
                 ]
-                # env tokens = template/tool tokens between previous_ids and this generation
-                full_prompt_ids = tok(texts[i], add_special_tokens=False)["input_ids"]
-
-                """
-                For multi-turn generation it checks if the new tokens are being properly appened without
-                changing the prefix tokens
-                
-                prev_ids[i]: The token IDs of conversation up to previous turn
-                full_prompt_ids: The token IDs of current conversation with the appended generated tokens
-                if the prefix of full_prompt_ids and prev_ids[i] doesn't match then our rollout_func is not properly appending the new tokens
-                this can cause the policy to be slightly off-policy.
-                """
-                if turn>0 and full_prompt_ids[:len(prev_ids[i])] != prev_ids[i]:
-                    VIOLATIONS["prefix"] +=1
-                    #We find the first position where the two tokens differ and log the surrounding tokens for debugging
-                    _j = next((k for k, (a, b) in enumerate(zip(full_prompt_ids, prev_ids[i])) if a != b),
-                              min(len(full_prompt_ids), len(prev_ids[i])))
-                    PREFIX_DETAILS.append({
-                        "first_diff": _j, "len_prev": len(prev_ids[i]), "len_new": len(full_prompt_ids),
-                        "prev_tokens": tok.convert_ids_to_tokens(prev_ids[i][max(0, _j - 4):_j + 4]),
-                        "new_tokens": tok.convert_ids_to_tokens(full_prompt_ids[max(0, _j - 4):_j + 4]),
-                        "turn1_finish": TURN1_FINISH[i],
-                    })
-
-                env_ids = full_prompt_ids[len(prev_ids[i]):] if turn > 0 else []
-                comp[i] += env_ids + gen_ids
-                lps[i] += [0.0] * len(env_ids) + gen_lp
-                mask[i] += [0] * len(env_ids) + [1] * len(gen_ids)
-                prev_ids[i] = full_prompt_ids + gen_ids
-                convs[i].append({"role": "assistant", "content": o.text})
+                # vLLM must report having seen exactly the ids we sent (no hidden re-tokenization / BOS changes)
+                if list(out.prompt_token_ids) != sent[i]:
+                    VIOLATIONS["vllm_prompt_mismatch"] += 1
+                # token-out: sampled ids go into the buffer exactly as produced
+                comp[i] += gen_ids
+                lps[i] += gen_lp
+                mask[i] += [1] * len(gen_ids)
+                ctx_ids[i] += gen_ids
+                last_sent[i], last_gen[i] = sent[i], gen_ids
+                if o.finish_reason == "length":
+                    # truncated: the buffer ends as sampled, nothing is added, the trajectory is over
+                    active[i] = False
+                    truncated[i] = True
+                    continue
                 if turn < MAX_TURNS - 1:
-                    convs[i].append({"role": "user", "content": echo_tool(o.text[:40])})
+                    tool_text = echo_tool(o.text[:40])           # decoded text is used for routing only
+                    env_ids = tool_delta_ids(tok, TOOL_ROLE, tool_text)
+                    comp[i] += env_ids
+                    lps[i] += [0.0] * len(env_ids)
+                    mask[i] += [0] * len(env_ids)
+                    ctx_ids[i] += env_ids
+                    continued[i] = True
+                    convs[i].append({"role": "assistant", "content": o.text})
+                    convs[i].append({"role": TOOL_ROLE, "content": tool_text})
+                else:
+                    active[i] = False
 
         #Alignment, logprob and sample checks
         """
@@ -226,13 +250,19 @@ def make_rollout_func():
             
             """Ensuring generated tokens have non-zero log probabilites"""
             VIOLATIONS["gen_lp_positive"] += sum(1 for m, lp in zip(mask[i], lps[i]) if m==1 and lp>0.0)
+        # TITO invariant: the last prompt sent to vLLM + its generation == the prompt + completion handed to TRL
+        VIOLATIONS["ctx_mismatch"] += sum(
+            1 for i in range(n) if last_sent[i] + last_gen[i] != p_ids[i] + comp[i])
+        _k = next((i for i in range(n) if continued[i]), 0)   # sample trajectory for the printed texts
         ROLLOUT_LOG.append({
             "n": n, "groups_ok": groups_ok, "n_groups": n_groups,
             "mean_len": sum(len(c) for c in comp) / n,
             "mean_gen": sum(sum(m) for m in mask) / n,
-            "min_env": min(len(m)-sum(m) for m in mask),
-            "env_text": tok.decode([t for t, m in zip(comp[0], mask[0]) if m == 0]),
-            "gen_text": tok.decode([t for t, m in zip(comp[0], mask[0]) if m == 1]),
+            "n_continued": sum(continued), "n_truncated": sum(truncated),
+            "min_env_continued": min((len(mask[i]) - sum(mask[i]) for i in range(n) if continued[i]), default=0),
+            "env_when_not_continued": sum(len(mask[i]) - sum(mask[i]) for i in range(n) if not continued[i]),
+            "env_text": tok.decode([t for t, m in zip(comp[_k], mask[_k]) if m == 0]),
+            "gen_text": tok.decode([t for t, m in zip(comp[_k], mask[_k]) if m == 1]),
             "gen_count_ok" : all(sum(mask[i])==gen_count[i] for i in range(n)),
         })
         return {
@@ -401,9 +431,11 @@ up our prefix tokens (d3 pass), but we are failing up with the token matching fo
 logged = [h["completions/mean_length"] for h in trainer.state.log_history if "completions/mean_length" in h]
 RESULTS["d1_alignment"] = (VIOLATIONS["len_mismatch"]==0 and VIOLATIONS["env_lp_nonzero"]==0 and VIOLATIONS["gen_lp_positive"] == 0)
 
-RESULTS["d2_env_tokens_present"] = bool(ROLLOUT_LOG) and all(r["min_env"] > 0 for r in ROLLOUT_LOG)
+RESULTS["d2_env_tokens_present"] = bool(ROLLOUT_LOG) and all(
+    r["n_continued"] > 0 and r["min_env_continued"] > 0 and r["env_when_not_continued"] == 0 for r in ROLLOUT_LOG)
 
-RESULTS["d3_prefix_preserving"] = VIOLATIONS["prefix"] == 0
+RESULTS["d3_ids_are_source_of_truth"] = VIOLATIONS["ctx_mismatch"] == 0
+RESULTS["d3b_vllm_saw_what_we_sent"] = VIOLATIONS["vllm_prompt_mismatch"] == 0
 
 """
 Dealing with d4 test failing we have a couple options:
@@ -459,7 +491,8 @@ print(f"[spike] (d6) rollout totals: raw tokens={sum(r['mean_len'] * r['n'] for 
 print(f"[spike] (d) violations={VIOLATIONS}; logged mean_length={logged}; mask-sum means={[round(r['mean_gen'],2) for r in ROLLOUT_LOG]}; raw means={[round(r['mean_len'], 2) for r in ROLLOUT_LOG]}")
 print("[spike] (d) mask==0 text (env):", repr(ROLLOUT_LOG[0]["env_text"]))
 print("[spike] (d) mask==1 text (model):", repr(ROLLOUT_LOG[0]["gen_text"]))
-print("[spike] (d3) prefix violation details:", PREFIX_DETAILS)
+print("[spike] (d3) (continued, truncated) per rollout call:", [(r["n_continued"], r["n_truncated"]) for r in ROLLOUT_LOG],
+      "| informational: old re-render approach would have differed", VIOLATIONS["rerender_differs"], "times")
 
 # # (d) grouping + env_mask reflected in completions/mean_length
 # hist = [h for h in trainer.state.log_history if "completions/mean_length" in h]

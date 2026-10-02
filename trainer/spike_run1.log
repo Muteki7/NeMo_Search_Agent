@@ -51,13 +51,18 @@ INFO 10-01 05:10:22 [bitsandbytes_loader.py:808] Loading weights with BitsAndByt
 INFO 10-01 05:10:24 [weight_utils.py:574] No model.safetensors.index.json found in remote.
 INFO 10-01 05:10:24 [weight_utils.py:849] Filesystem type for checkpoints: EXT4. Checkpoint size: 1.03 GiB. Available RAM: 20.74 GiB.
 INFO 10-01 05:10:24 [weight_utils.py:872] Auto-prefetch is disabled because the filesystem (EXT4) is not a recognized network FS (NFS/Lustre). If you want to force prefetching, start vLLM with --safetensors-load-strategy=prefetch.
-Loading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]
-Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00, 142.63it/s]
+
+Loading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]
+
+Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00, 142.63it/s]
 
 INFO 10-01 05:10:24 [weight_utils.py:849] Filesystem type for checkpoints: EXT4. Checkpoint size: 1.03 GiB. Available RAM: 20.74 GiB.
-Loading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]
-Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  1.93it/s]
-Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  1.93it/s]
+
+Loading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]
+
+Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  1.93it/s]
+
+Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  1.93it/s]
 
 INFO 10-01 05:10:25 [punica_selector.py:20] Using PunicaWrapperGPU.
 INFO 10-01 05:10:26 [model_runner.py:302] Model loading took 1.16 GiB and 4.060044 seconds
@@ -92,14 +97,36 @@ WARNING 10-01 05:10:29 [import_utils.py:408]   File "/home/nk/projects/NeMo_sear
 WARNING 10-01 05:10:29 [import_utils.py:408]     assert cuda_home is not None
 WARNING 10-01 05:10:29 [import_utils.py:408]            ^^^^^^^^^^^^^^^^^^^^^
 WARNING 10-01 05:10:29 [import_utils.py:408] AssertionError
-Capturing CUDA graphs (PIECEWISE):   0%|          | 0/22 [00:00<?, ?it/s]Capturing CUDA graphs (PIECEWISE):   9%|▉         | 2/22 [00:00<00:01, 11.70it/s]Capturing CUDA graphs (PIECEWISE):  18%|█▊        | 4/22 [00:00<00:01, 14.81it/s]Capturing CUDA graphs (PIECEWISE):  27%|██▋       | 6/22 [00:00<00:00, 16.59it/s]Capturing CUDA graphs (PIECEWISE):  36%|███▋      | 8/22 [00:00<00:00, 17.34it/s]Capturing CUDA graphs (PIECEWISE):  45%|████▌     | 10/22 [00:00<00:00, 17.62it/s]Capturing CUDA graphs (PIECEWISE):  55%|█████▍    | 12/22 [00:00<00:00, 17.65it/s]Capturing CUDA graphs (PIECEWISE):  64%|██████▎   | 14/22 [00:00<00:00, 18.33it/s]Capturing CUDA graphs (PIECEWISE):  77%|███████▋  | 17/22 [00:00<00:00, 21.24it/s]Capturing CUDA graphs (PIECEWISE):  91%|█████████ | 20/22 [00:01<00:00, 22.13it/s]Capturing CUDA graphs (PIECEWISE): 100%|██████████| 22/22 [00:01<00:00, 19.09it/s]
-Capturing CUDA graphs (FULL):   0%|          | 0/14 [00:00<?, ?it/s]Capturing CUDA graphs (FULL):   7%|▋         | 1/14 [00:00<00:01,  7.03it/s]Capturing CUDA graphs (FULL):  29%|██▊       | 4/14 [00:00<00:00, 14.67it/s]Capturing CUDA graphs (FULL):  50%|█████     | 7/14 [00:00<00:00, 18.85it/s]Capturing CUDA graphs (FULL):  71%|███████▏  | 10/14 [00:00<00:00, 20.75it/s]Capturing CUDA graphs (FULL): 100%|██████████| 14/14 [00:00<00:00, 23.13it/s]Capturing CUDA graphs (FULL): 100%|██████████| 14/14 [00:00<00:00, 20.30it/s]
+
+Capturing CUDA graphs (PIECEWISE):   0%|          | 0/22 [00:00<?, ?it/s]
+Capturing CUDA graphs (PIECEWISE):   9%|▉         | 2/22 [00:00<00:01, 11.70it/s]
+Capturing CUDA graphs (PIECEWISE):  18%|█▊        | 4/22 [00:00<00:01, 14.81it/s]
+Capturing CUDA graphs (PIECEWISE):  27%|██▋       | 6/22 [00:00<00:00, 16.59it/s]
+Capturing CUDA graphs (PIECEWISE):  36%|███▋      | 8/22 [00:00<00:00, 17.34it/s]
+Capturing CUDA graphs (PIECEWISE):  45%|████▌     | 10/22 [00:00<00:00, 17.62it/s]
+Capturing CUDA graphs (PIECEWISE):  55%|█████▍    | 12/22 [00:00<00:00, 17.65it/s]
+Capturing CUDA graphs (PIECEWISE):  64%|██████▎   | 14/22 [00:00<00:00, 18.33it/s]
+Capturing CUDA graphs (PIECEWISE):  77%|███████▋  | 17/22 [00:00<00:00, 21.24it/s]
+Capturing CUDA graphs (PIECEWISE):  91%|█████████ | 20/22 [00:01<00:00, 22.13it/s]
+Capturing CUDA graphs (PIECEWISE): 100%|██████████| 22/22 [00:01<00:00, 19.09it/s]
+
+Capturing CUDA graphs (FULL):   0%|          | 0/14 [00:00<?, ?it/s]
+Capturing CUDA graphs (FULL):   7%|▋         | 1/14 [00:00<00:01,  7.03it/s]
+Capturing CUDA graphs (FULL):  29%|██▊       | 4/14 [00:00<00:00, 14.67it/s]
+Capturing CUDA graphs (FULL):  50%|█████     | 7/14 [00:00<00:00, 18.85it/s]
+Capturing CUDA graphs (FULL):  71%|███████▏  | 10/14 [00:00<00:00, 20.75it/s]
+Capturing CUDA graphs (FULL): 100%|██████████| 14/14 [00:00<00:00, 23.13it/s]
+Capturing CUDA graphs (FULL): 100%|██████████| 14/14 [00:00<00:00, 20.30it/s]
 INFO 10-01 05:10:32 [model_runner.py:726] Graph capturing finished in 2 secs, took 0.22 GiB
 INFO 10-01 05:10:32 [jit_monitor.py:60] Kernel JIT monitor activated — Triton JIT compilations during inference will be logged as warnings.
 INFO 10-01 05:10:32 [core.py:337] init engine (profile, create kv cache, warmup model) took 6.57 s (compilation: 2.19 s)
 `torch_dtype` is deprecated! Use `dtype` instead!
 Unsloth: Just some info: will skip parsing ['attention_norm', 'post_per_layer_input_norm', 'pre_feedforward_layernorm', 'layer_norm2', 'input_layernorm', 'post_layernorm', 'post_attention_layernorm', 'layer_norm1', 'norm2', 'q_norm', 'k_norm', 'ffn_norm', 'norm1', 'norm', 'post_feedforward_layernorm']
-Loading weights:   0%|          | 0/146 [00:00<?, ?it/s]Loading weights:  28%|██▊       | 41/146 [00:00<00:00, 403.07it/s]Loading weights:  68%|██████▊   | 99/146 [00:00<00:00, 501.32it/s]Loading weights: 100%|██████████| 146/146 [00:00<00:00, 670.21it/s]
+
+Loading weights:   0%|          | 0/146 [00:00<?, ?it/s]
+Loading weights:  28%|██▊       | 41/146 [00:00<00:00, 403.07it/s]
+Loading weights:  68%|██████▊   | 99/146 [00:00<00:00, 501.32it/s]
+Loading weights: 100%|██████████| 146/146 [00:00<00:00, 670.21it/s]
 Unsloth: Will load unsloth/llama-3.2-1b-instruct-unsloth-bnb-4bit as a legacy tokenizer.
 Unsloth 2026.9.12 patched 16 layers with 16 QKV layers, 16 O layers and 16 MLP layers.
 The tokenizer has new PAD/BOS/EOS tokens that differ from the model config and generation config. The model config and generation config were aligned accordingly, being updated with the tokenizer's values. Updated tokens: {'pad_token_id': 128004}.
@@ -115,7 +142,8 @@ Unsloth: GRPO now defaults to TRL's loss_type = 'dapo' with beta = 0.0. Set loss
 [spike] (a) grep -c rollout_func /home/nk/projects/NeMo_search_agent/trainer/unsloth_compiled_cache/UnslothGRPOTrainer.py -> 15
 [spike] (b) trainer.llm is model.vllm_engine: False; vllm_generation=VLLMGeneration; reuses=True
 [spike] (b) VRAM load=10454 MiB, after trainer init=10454 MiB
-  0%|          | 0/2 [00:00<?, ?it/s]WARNING 10-01 05:10:41 [input_processor.py:157] vLLM has deprecated support for supporting different tokenizers for different LoRAs. By default, vLLM uses base model's tokenizer. If you are using a LoRA with its own tokenizer, consider specifying `--tokenizer [lora_path]` to use the LoRA tokenizer.
+
+  0%|          | 0/2 [00:00<?, ?it/s]WARNING 10-01 05:10:41 [input_processor.py:157] vLLM has deprecated support for supporting different tokenizers for different LoRAs. By default, vLLM uses base model's tokenizer. If you are using a LoRA with its own tokenizer, consider specifying `--tokenizer [lora_path]` to use the LoRA tokenizer.
 WARNING 10-01 05:10:41 [jit_monitor.py:106] Triton kernel JIT compilation during inference: _topk_topp_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
 WARNING 10-01 05:10:41 [jit_monitor.py:106] Triton kernel JIT compilation during inference: _topk_log_softmax_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
 Ignoring clean_up_tokenization_spaces=True for BPE tokenizer CachedTokenizersBackend. The clean_up_tokenization post-processing step is designed for WordPiece tokenizers and is destructive for BPE (it strips spaces before punctuation). Set clean_up_tokenization_spaces=False to suppress this warning, or set clean_up_tokenization_spaces_for_bpe_even_though_it_will_corrupt_output=True to force cleanup anyway.
@@ -135,7 +163,19 @@ WARNING 10-01 05:10:42 [jit_monitor.py:106] Triton kernel JIT compilation during
   return original(name)
 WARNING 10-01 05:10:46 [jit_monitor.py:106] Triton kernel JIT compilation during inference: _rms_layernorm_backward. This causes a latency spike; consider extending warmup to cover this shape/config.
 WARNING 10-01 05:10:46 [jit_monitor.py:106] Triton kernel JIT compilation during inference: _DWf_DW_dfg_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
- 50%|█████     | 1/2 [00:04<00:04,  4.80s/it]                                              50%|█████     | 1/2 [00:04<00:04,  4.80s/it]100%|██████████| 2/2 [00:06<00:00,  3.06s/it]                                             100%|██████████| 2/2 [00:06<00:00,  3.06s/it]                                             100%|██████████| 2/2 [00:06<00:00,  3.06s/it]100%|██████████| 2/2 [00:06<00:00,  3.32s/it]
+
+ 50%|█████     | 1/2 [00:04<00:04,  4.80s/it]
+                                             
+
+ 50%|█████     | 1/2 [00:04<00:04,  4.80s/it]
+100%|██████████| 2/2 [00:06<00:00,  3.06s/it]
+                                             
+
+100%|██████████| 2/2 [00:06<00:00,  3.06s/it]
+                                             
+
+100%|██████████| 2/2 [00:06<00:00,  3.06s/it]
+100%|██████████| 2/2 [00:06<00:00,  3.32s/it]
 {'loss': '0.0108', 'grad_norm': '0.5175', 'learning_rate': '0', 'num_tokens': '1187', 'completions/mean_length': '106.4', 'completions/min_length': '71', 'completions/max_length': '128', 'completions/clipped_ratio': '0.625', 'completions/mean_terminated_length': '76.67', 'completions/min_terminated_length': '71', 'completions/max_terminated_length': '81', 'rewards/reward_len/mean': '2.5', 'rewards/reward_len/std': '1.773', 'reward': '2.5', 'reward_std': '1.773', 'frac_reward_zero_std': '0', 'completion_length': '106.4', 'kl': '0', 'clip_ratio/low_mean': '0', 'clip_ratio/low_min': '0', 'clip_ratio/high_mean': '0', 'clip_ratio/high_max': '0', 'clip_ratio/region_mean': '0', 'step_time': '4.672', 'epoch': '0.25'}
 Unsloth: Double buffering enabled (parallel H2D + compute) for backward pass.
 {'loss': '0.07407', 'grad_norm': '0.4866', 'learning_rate': '0.0001', 'num_tokens': '2397', 'completions/mean_length': '109.2', 'completions/min_length': '59', 'completions/max_length': '128', 'completions/clipped_ratio': '0.25', 'completions/mean_terminated_length': '103', 'completions/min_terminated_length': '59', 'completions/max_terminated_length': '118', 'rewards/reward_len/mean': '2.25', 'rewards/reward_len/std': '2.55', 'reward': '2.25', 'reward_std': '2.55', 'frac_reward_zero_std': '0', 'completion_length': '109.2', 'kl': '0', 'clip_ratio/low_mean': '0', 'clip_ratio/low_min': '0', 'clip_ratio/high_mean': '0', 'clip_ratio/high_max': '0', 'clip_ratio/region_mean': '0', 'step_time': '1.784', 'epoch': '0.5'}
