@@ -209,7 +209,7 @@ def make_rollout_func():
                 gen_count[i] += len(gen_ids)
                 gen_lp = [
                     list(d.values())[0].logprob if d else 0.0
-                    """vllm is returning logprobs for each token in the sampled sequence, but if logprobs=0.0 we need to handle that case by returning 0.0?"""
+                    #vllm is returning logprobs for each token in the sampled sequence, but if logprobs=0.0 we need to handle that case by returning 0.0?
                     for d in (o.logprobs or [None] * len(gen_ids))
                 ]
                 # vLLM must report having seen exactly the ids we sent (no hidden re-tokenization / BOS changes)
