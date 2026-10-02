@@ -37,6 +37,7 @@ reasoning_model/search_gym/
     ├── rollout.py      # generic multi-turn rollout_func + gym client (TITO token buffer, see step 5)
     ├── train_grpo.py   # Unsloth model + GRPOTrainer(rollout_func=..., reward_funcs=[gym_verify_reward])
     ├── eval.py         # held-out eval, with and without LoRA
+    ├── prompting.py    # renders chat prompts with the template date pinned (26 Jul 2024); all render sites must use it
     ├── spike_rollout_func.py        # Gate 1 spike (passed); its rollout is the reference for rollout.py
     └── temp/working_stack.freeze.txt  # frozen package versions of the working venv
 ```
@@ -61,15 +62,23 @@ AutoDidact stays untouched as a reference.
 - **Limits:** d6 checks counts, not token positions. The sample is small, and `MAX_NEW=64` truncates many trajectories early (a real run needs a larger cap).
 - **Lessons that carried into the design:** TRL passes prompts already repeated `num_generations` times, so `rollout_func` returns exactly one trajectory per incoming prompt. The fallback (plain TRL + PEFT, smaller model) was not needed.
 
-### 2. Data: `scripts/convert_questions.py`
-- Read `AutoDidact/saved_data/questions.json` (1434 rows of `{chunk_id, question, answer, difficulty}`).
-- Emit NeMo Gym JSONL rows:
+### 2. Data: `scripts/convert_questions.py`: DONE
+Script: `NeMo_Gym/resources_servers/mission_search/scripts/convert_questions.py` (needs only the standard library for the default split; `--split legacy` also needs `datasets`). Outputs: `NeMo_Gym/resources_servers/mission_search/data/{train,validation,example}.jsonl` (`train`/`validation` are git-ignored; regenerate with the script). Status (2026-10-02): 1,240 train / 148 validation / 5 example rows, all validated against Gym's `BaseRunRequest`.
+- Reads `Step2_Files/Saved_data/questions.json` (1434 rows of `{chunk_id, question, answer, difficulty}`; `--input` overrides).
+- Emits NeMo Gym JSONL rows:
   - `responses_create_params`:
-    - `input`: system prompt from `get_system_prompt()` and user prompt from `build_user_prompt(q)`, both in `rl_helpers.py:22,52`.
-    - `tools`: `SEARCH_TOOL_DEFINITION` (`rl_helpers.py:34`) converted to the flat Responses-API form `{type, name, description, parameters, strict}`.
+    - `input`: a `system` message and a `user` message. Both functions are copied from `rl_helpers.py` (lines 22 and 52), not imported, because `rl_helpers` pulls in torch, trl and the Chroma loader. The system prompt keeps only the two instruction sentences: AutoDidact's hand-written "Cutting Knowledge Date / Today Date" header was dropped because the Llama template adds that header itself (it appeared twice). The tool definition stays inside the user prompt text, as in AutoDidact.
+    - `tools`: `SEARCH_TOOL_DEFINITION` converted to the flat Responses-API form `{type, name, description, parameters, strict}` with `strict: false` (the key is required by Gym's schema; our rollout parses JSON from text and never uses strict decoding).
     - `parallel_tool_calls`: `false`.
-  - Top-level fields: `answer`, `difficulty`, `chunk_id`.
-- Split 90/10 with seed 42 (same as `search_module.get_qa_dataset`, `search_module.py:161`) into `train.jsonl`/`validation.jsonl`, plus 5 rows in `example.jsonl`.
+  - Top-level fields: `answer`, `difficulty` (26 malformed labels like `==Difficulty: easy==` normalised to easy/medium/hard), `chunk_id`. Validation rows also carry `block`.
+- **Split (deviation from the original plan, which copied AutoDidact's seed-42 random split).** Default `--split purged`:
+  - `chunk_id` is the centre of a 3-chunk generation window, so questions share source text when their ids differ by 2 or less.
+  - Validation = 6 separate blocks of 13 consecutive chunk ids (about 10%), chosen by SHA-256 hash order (seed 42), not by a random generator, so the blocks are the same forever (byte-identical output on Python 3.12 and 3.13).
+  - Training rows within 2 ids of any validation row are purged (46 rows), and so are training rows whose normalised question text appears in validation (0 in the current blocks; the branch was unit-tested on synthetic data). Purged rows are in neither set.
+  - The script asserts min id distance > 2 and zero question overlap between train and validation on every run.
+  - `--split legacy` reproduces AutoDidact's `get_qa_dataset()` exactly (verified row for row), kept for reference. It leaks: 21 of 144 validation questions also appear in train, and 128 of 144 share a chunk with a train row.
+  - 5 rows from the start of the (hash-shuffled) train set go to `example.jsonl`.
+- Caveat: neighbouring chunks are not independent for a document-wide corpus, and the agent searches the whole corpus at evaluation time, so this reduces leakage rather than eliminating it. No separate test block yet (add one when tuning against validation begins).
 
 ### 3. Index: `scripts/build_index.py`
 Rebuild Chroma inside the server venv from `AutoDidact/saved_data/chunks.pkl`, using `CustomHuggingFaceEmbeddings` on CPU and collection `example_collection`. This mirrors `generate_data.py:46-52` and avoids carrying the old sqlite across chromadb versions. It takes a couple of minutes for 753 chunks.
@@ -88,7 +97,7 @@ Rebuild Chroma inside the server venv from `AutoDidact/saved_data/chunks.pkl`, u
 - **Gym client:** discover server host/port from the head server's `GET :11000/global_config_dict_yaml`. Copy the pattern from `Example_NeMo.ipynb` cell 7.
 - **`make_rollout_func(max_turns=5)`**, a batched loop modelled on `run_agent` (`rl_helpers.py:288`):
   - TRL passes prompts already repeated `num_generations` times: return exactly one trajectory per incoming prompt, in the same order. Do not multiply by `num_generations` again.
-  - **TITO (token-in, token-out).** Each trajectory keeps a running id buffer (`ctx_ids`), initialised from the tokenized prompt (`apply_chat_template(..., add_generation_prompt=True, tokenize=True, return_dict=False)`). The buffer is the source of truth, and nothing decoded is ever re-encoded.
+  - **TITO (token-in, token-out).** Each trajectory keeps a running id buffer (`ctx_ids`), initialised from the tokenized prompt (`prompting.apply_chat_template(tok, messages, add_generation_prompt=True, tokenize=True, return_dict=False)`; every render goes through `prompting.py`, which pins the template's date so prompts are identical on any day). The buffer is the source of truth, and nothing decoded is ever re-encoded.
   - Generate from ids: `generate([{"prompt_token_ids": ctx_ids[i]}, ...], ..., lora_request=...)`, with the call from step 1(c). Sampled ids are appended to the buffer and to `completion_ids` exactly as vLLM produced them.
   - Decode the sampled text only to route the tool call: parse with `extract_json_objects` (`rl_helpers.py:89`, copied), accepting `{"name","parameters"|"arguments"}` or a nested `"function"` form. The decoded text is never fed back into the prompt.
   - If there's a tool call, POST `/{name}`, then append the tool message as a template-diff delta by id: render a dummy `[user, assistant]` conversation with and without the tool message (role `ipython`), subtract the token lists, and append the difference. Assert the prefix is unchanged on every call, and run the same prefix-preservation property check at startup. Otherwise mark the trajectory done.

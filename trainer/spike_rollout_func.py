@@ -16,6 +16,8 @@ from datasets import Dataset  # noqa: E402
 from trl import GRPOConfig, GRPOTrainer  # noqa: E402
 from vllm import SamplingParams  # noqa: E402
 
+from prompting import apply_chat_template, assert_date_pinned  # noqa: E402  (renders prompts with the date pinned)
+
 MODEL = "unsloth/Llama-3.2-1B-Instruct"
 NUM_GEN = 4
 MAX_TURNS = 2
@@ -133,8 +135,8 @@ _DUMMY = [{"role": "user", "content": "dummy"}, {"role": "assistant", "content":
 def tool_delta_ids(tok, role, text):
     """Ids to append after a sampled assistant turn: the tool message + the opening of the next assistant turn.
     Template-diff delta: render a dummy conversation with and without the tool message, subtract by ids."""
-    prefix = tok.apply_chat_template(_DUMMY, tokenize=True, return_dict=False)
-    full = tok.apply_chat_template(_DUMMY + [{"role": role, "content": text}],
+    prefix = apply_chat_template(tok, _DUMMY, tokenize=True, return_dict=False)
+    full = apply_chat_template(tok, _DUMMY + [{"role": role, "content": text}],
                                    tokenize=True, return_dict=False, add_generation_prompt=True)
     assert full[:len(prefix)] == prefix, f"chat template is not prefix-preserving for role={role!r}"
     return list(full[len(prefix):])
@@ -143,6 +145,9 @@ def tool_delta_ids(tok, role, text):
 # startup property check: appending a tool message must extend the render token-for-token (raises if not)
 _probe_delta = tool_delta_ids(tokenizer, TOOL_ROLE, "dummy")
 RESULTS["d3c_template_prefix_preserving"] = True
+# the rendered system header must appear once and carry the pinned date (not today's date)
+assert_date_pinned(apply_chat_template(tokenizer, [{"role": "system", "content": "x"}, {"role": "user", "content": "y"}], tokenize=False))
+RESULTS["d3d_prompt_date_pinned"] = True
 print(f"[spike] (d3c) template is prefix-preserving for role={TOOL_ROLE!r}; delta = {tokenizer.decode(_probe_delta)!r}")
 
 
@@ -168,7 +173,7 @@ def make_rollout_func():
         n_groups = len({json.dumps(p) for p in prompts})
 
         convs = [list(m) for m in prompts]      # message bookkeeping, ONLY for the informational re-render counter
-        p_ids = [list(tok.apply_chat_template(m, add_generation_prompt=True, tokenize=True, return_dict=False))
+        p_ids = [list(apply_chat_template(tok, m, add_generation_prompt=True, tokenize=True, return_dict=False))
                  for m in prompts]
         comp = [[] for _ in range(n)]
         lps = [[] for _ in range(n)]
@@ -189,7 +194,7 @@ def make_rollout_func():
             if turn > 0:
                 # informational only: would the OLD approach (re-render the messages) have given the same ids?
                 for i in idx:
-                    rr = tok.apply_chat_template(convs[i], add_generation_prompt=True, tokenize=True, return_dict=False)
+                    rr = apply_chat_template(tok, convs[i], add_generation_prompt=True, tokenize=True, return_dict=False)
                     if list(rr) != ctx_ids[i]:
                         VIOLATIONS["rerender_differs"] += 1
             CALL_LOG["generate_calls"] += 1
@@ -204,6 +209,7 @@ def make_rollout_func():
                 gen_count[i] += len(gen_ids)
                 gen_lp = [
                     list(d.values())[0].logprob if d else 0.0
+                    """vllm is returning logprobs for each token in the sampled sequence, but if logprobs=0.0 we need to handle that case by returning 0.0?"""
                     for d in (o.logprobs or [None] * len(gen_ids))
                 ]
                 # vLLM must report having seen exactly the ids we sent (no hidden re-tokenization / BOS changes)
@@ -368,8 +374,8 @@ RESULTS["c1_adapter_updated"] = b_before <1e-9 and b_after > 0.0
 print(f"[spike] (c1) sum|lora_b| before={b_before:.3e} after={b_after:.3e}")
 
 eng = trainer.model.vllm_engine
-prompt_text = tokenizer.apply_chat_template(
-    [{"role": "user", "content": "Say something about number 3."}],
+prompt_text = apply_chat_template(
+    tokenizer, [{"role": "user", "content": "Say something about number 3."}],
     add_generation_prompt=True, tokenize=False)
 
 """
