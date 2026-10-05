@@ -7,7 +7,7 @@
 | Project | Train a small model to answer questions with a search tool |
 | Scope | Changes in approach and changes in tests |
 | Not in scope | Package problems. See `Dependency_hell.md`. |
-| Last update | 2026-10-02 |
+| Last update | 2026-10-05 |
 
 ## 1. How to read this file
 
@@ -25,7 +25,7 @@ Use the same name for the same thing every time.
 |---|---|---|
 | chunk | A piece of the source document, about 1000 characters long | part, segment |
 | window | Three chunks in a row. The question generator reads one window at a time. | span |
-| chunk id | The number of the middle chunk of a window | chunk number |
+| chunk id | The number of the middle chunk of a window. It is an old position (see below). | chunk number |
 | prompt | The messages that start a trajectory: one system message and one user message | question text |
 | turn | One answer from the model, and the tool message after it | step |
 | context | All the tokens that the model reads before it chooses the next token | history |
@@ -47,6 +47,18 @@ Use the same name for the same thing every time.
 | purge distance | The number of chunk ids around a validation block. We remove the train rows in this distance. | buffer, margin |
 | purge | To remove a row from the train set | drop, filter |
 | pinned date | The fixed date that we give to the chat template | frozen date |
+| vector | A list of numbers that stands for one text | embedding |
+| embedder | The object that turns text into vectors. Its class is `CustomHuggingFaceEmbeddings`. | encoder |
+| index | The Chroma files on disk. They hold the vectors and the chunk text. | database |
+| top k | The k results that are nearest to the question | first k |
+| old position | The number of a chunk before the merge. `chunk_id` in `questions.json` is an old position. | original id |
+| merge | To glue a short chunk onto the chunk after it | join, combine |
+| tiny chunk | A chunk with fewer than 50 characters | fragment |
+| minimum chunk size | The value of `--min-chars`. A chunk with fewer characters is merged. | threshold |
+| retrieval test | A test that asks the index real questions and counts the hits. The code name is `retrieval_check`. | index check |
+| window recall | The share of questions for which the top k results hold a chunk of the question window | hit rate |
+| centre-chunk recall | The share of questions for which the top k results hold the middle chunk of the window | exact recall |
+| answer coverage | The share of questions for which a top k result holds at least 60% of the answer key words | answer hit rate |
 
 ## 3. Learnings
 
@@ -292,8 +304,97 @@ The result is 1,240 train rows and 148 validation rows. The purge distance remov
 - Write the reason for a decision in this file when you make it.
 - Say in the chat when the work is different from `Plan.md`.
 - Say in the chat the full path of each new file, and the reason for it.
+- Measure a problem before you fix it. Compare the options on the same questions.
 
 **Where.** `rules.md` and `Plan.md`.
+
+### L11. Test the index with real questions
+
+**Problem.** After a build, the index can have the right row count and still search badly. A wrong model or a wrong pooling gives vectors that do not match. A row count cannot show this.
+
+**Cause.** A test that counts rows has no way to fail on bad search. We also needed a way to tell if a change to the chunks helps.
+
+**Solution.** The build script runs a retrieval test after each build:
+
+1. Open the index again from disk. A new Chroma object must see all the rows. The index needs the embedder only for queries.
+2. Ask the index 400 real questions. The test takes every third question.
+3. Count three hit rates for the top 2 and the top 5: window recall, centre-chunk recall and answer coverage.
+4. Assert that the window recall at top 5 is above 30%. Chance is only a few percent.
+
+The three hit rates look at different things. Window recall counts chunk numbers: the search found the right area. Centre-chunk recall is strict: the search found the middle chunk. Answer coverage reads the text: a result holds the key words of the answer.
+
+The script has two safety rules. It uses fixed ids `chunk-<index>`. It refuses a folder that is not empty, unless you add `--rebuild`. Without this rule, Chroma adds duplicate rows. The embedder runs on the CPU, so the GPU stays free for the train run.
+
+**Result.** The values below are for the top 2 and the top 5, before the merge (L12):
+
+- Window recall: 78.5% and 88.0%.
+- Centre-chunk recall: 34.0% and 46.5%.
+- Answer coverage: 73.0% and 82.0%.
+
+**Limits.**
+
+- The test takes every third question and stops at 400. So it never tests the last 16% of the questions.
+- The floor of 30% finds only a broken index.
+- Answer coverage is rough, because the answers are paraphrases.
+
+**Rule.**
+
+- Test the index after each build.
+- Use more than one hit rate. Read the chunk numbers and the text.
+- Keep the numbers from before a change. Then you can see if the change helps.
+
+**Where.** `retrieval_check` in `NeMo_Gym/resources_servers/mission_search/scripts/build_index.py`.
+
+### L12. Merge the short chunks
+
+**Problem.** 206 of 753 chunks have fewer than 50 characters. They fill 12.9% of the top-2 results. The agent gets almost no text from such a result.
+
+**Cause.** The loader made one element for each title, page ID and caption. The splitter cut each element alone. It never joined a short element to the element next to it. Of the 206 tiny chunks, 124 are titles, 46 are page or document IDs and 33 are captions.
+
+**Solution.** We merge the short chunks:
+
+1. Go through the chunks in order.
+2. If the current chunk has fewer than 100 characters, add the next chunk to it. Put a newline between them.
+3. Repeat until the chunk has 100 characters or more. Never go above 1500 characters.
+4. Do not touch a chunk that already has 100 characters or more.
+
+The result is 510 chunks, where there were 753. There are 186 merged groups. 324 chunks stay as they were. The shortest chunk has 101 characters and the longest has 1089, so the limit of 1500 never applies. A title joins the text of its section. The three pieces on the title page (9, 28 and 171 characters) become one chunk.
+
+`questions.json` and the purged split use the old positions. We did not change them. Each merged chunk keeps `chunk_start`, `chunk_end` and `n_merged`, and the retrieval test uses these values. The option `--min-chars 0` gives the old 753 chunks.
+
+**How we chose.** We compared five variants on all 1,434 questions. The search in this test was exact and ran in memory. It matched the real index within 0.5 points on the same 400 questions.
+
+| Variant | Chunks | Answer coverage at top 2 and top 5 | Window recall at top 2 |
+|---|---|---|---|
+| Baseline | 753 | 72.0 and 83.3 | 76.9 |
+| Drop the chunks under 50 | 547 | 74.3 and 84.0 | 76.8 |
+| Merge to 100 | 510 | 75.0 and 85.3 | 77.0 |
+| Merge to 200 | 459 | 74.1 and 85.1 | 75.2 |
+| Merge to 300 | 389 | 73.2 and 84.7 | 72.2 |
+
+Window recall stays the same for 100. It falls for 200 and 300. So we chose 100.
+
+**Result in the real index.** On the same 400 questions, the values for the top 2 and the top 5 changed in this way:
+
+- Answer coverage: 73.0% to 75.0%, and 82.0% to 83.8%.
+- Window recall: 78.5% to 77.5%, and 88.0% to 87.5%.
+- Centre-chunk recall: 34.0% to 44.2%, and 46.5% to 57.2%.
+
+**Choices that we did not make.**
+
+- We did not drop the tiny chunks. 30 questions (2.1%) have an answer only in a tiny chunk.
+- We did not use 200 or 300. The window recall falls and the answer coverage does not improve.
+- We did not use parent-child retrieval. It needs a second store and it changes what the agent reads. We can use it later if the corpus grows.
+
+**What stays open.** The gain is small, about 2 points of answer coverage. The agent can search again, so the real gain can be smaller. 15.3% of the chunks are still shorter than 200 characters. The rise of the centre-chunk recall is partly mechanical, because a merged chunk covers more positions.
+
+**Rule.**
+
+- Measure the problem before you fix it.
+- Compare the options on the same questions.
+- Keep the old chunk numbers when you change the chunks.
+
+**Where.** `merge_small_chunks` in `NeMo_Gym/resources_servers/mission_search/scripts/build_index.py`.
 
 ## 4. Procedures
 
@@ -318,9 +419,22 @@ To use the old split, add `--split legacy`. Use the environment with the `datase
 5. Make sure that the line shows PASS.
 6. If a check shows FAIL, read the `[spike]` lines for that check.
 
+### 4.3 Build the index
+
+> CAUTION: Do not use `--rebuild` with a folder that you want to keep. The script deletes the folder `chroma_index` and builds it again.
+
+1. Go to the repository root.
+2. Run `NeMo_Gym/resources_servers/mission_search/.venv/bin/python NeMo_Gym/resources_servers/mission_search/scripts/build_index.py --rebuild`.
+3. Find the line that starts with `[merge]`. Make sure that it shows 510 chunks and `under 100: 0`.
+4. Find the lines that start with `[check]`. Make sure that the window recall at top 5 is above 30%.
+
+The build takes about 20 s. To keep all 753 chunks, add `--min-chars 0`. To test without a change to the real index, add `--out-dir` with a new folder.
+
 ## 5. Open items
 
 - The Llama chat template puts quotation marks around the content of a tool message. We probably do not want this for search results. Decide how to add the search results, and run the prefix check again.
 - A reasoning model can remove or shorten old turns. TITO does not work after such a change. Keep the text before the last change as the prompt, and train only on the tokens after it.
 - Hold out a second set for a final test when we start to tune against the validation set.
 - Delete the counter for the old render method after we measure it on a larger sample.
+- The retrieval test never tests the last 16% of the questions. Use a larger step, so that the sample covers the whole file.
+- `Debug_checks.md` and the pictures in `Schema_learning` show the index before the merge (753 chunks and the old line numbers). Update them before the next debug session.

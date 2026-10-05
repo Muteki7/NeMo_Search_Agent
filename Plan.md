@@ -27,12 +27,14 @@ reasoning_model/search_gym/
 ├── Gym/                                   # git clone NVIDIA-NeMo/Gym (own uv venv, Python 3.13.14 pinned)
 │   └── resources_servers/mission_search/  # our environment (NeMo Gym scaffold layout)
 │       ├── app.py            # tool endpoint + verify
-│       ├── embeddings.py     # copied from AutoDidact/embeddings.py
+│       ├── embeddings.py     # copied from AutoDidact/embeddings.py (CPU, batched); used by build_index.py and the search tool
 │       ├── configs/mission_search.yaml, configs/resources_only.yaml
-│       ├── data/{example,train,validation}.jsonl, chroma_index/
+│       ├── data/{example,train,validation}.jsonl
+│       ├── chroma_index/     # built by scripts/build_index.py: 510 merged chunks (git-ignored)
+│       ├── .venv/            # server venv, built from requirements.txt the way Gym builds it (git-ignored)
 │       ├── scripts/build_index.py, scripts/convert_questions.py
 │       ├── tests/{test_app.py, verifier_cases.jsonl}
-│       └── requirements.txt  # -e nemo-gym[dev] @ ../../ , langchain-chroma, chromadb, transformers, torch (CPU)
+│       └── requirements.txt  # -e nemo-gym[dev] @ ../../Gym; CPU-only torch pinned by URL; pinned transformers, chromadb, langchain-chroma, langchain-core
 └── trainer/                               # training venv: currently trainer/temp/.venv-temp (Python 3.12), see Dependency_hell.md
     ├── rollout.py      # generic multi-turn rollout_func + gym client (TITO token buffer, see step 5)
     ├── train_grpo.py   # Unsloth model + GRPOTrainer(rollout_func=..., reward_funcs=[gym_verify_reward])
@@ -80,12 +82,21 @@ Script: `NeMo_Gym/resources_servers/mission_search/scripts/convert_questions.py`
   - 5 rows from the start of the (hash-shuffled) train set go to `example.jsonl`.
 - Caveat: neighbouring chunks are not independent for a document-wide corpus, and the agent searches the whole corpus at evaluation time, so this reduces leakage rather than eliminating it. No separate test block yet (add one when tuning against validation begins).
 
-### 3. Index: `scripts/build_index.py`
-Rebuild Chroma inside the server venv from `AutoDidact/saved_data/chunks.pkl`, using `CustomHuggingFaceEmbeddings` on CPU and collection `example_collection`. This mirrors `generate_data.py:46-52` and avoids carrying the old sqlite across chromadb versions. It takes a couple of minutes for 753 chunks.
+### 3. Index: `scripts/build_index.py`: DONE
+Script: `NeMo_Gym/resources_servers/mission_search/scripts/build_index.py`. Run it with the server venv (`NeMo_Gym/resources_servers/mission_search/.venv/bin/python`). Output: `NeMo_Gym/resources_servers/mission_search/chroma_index/` (collection `example_collection`, 510 rows, 5.2 MB, git-ignored). Status (2026-10-05): built, reopened from disk, and tested with real questions.
+- **Environment (deviation).** The server venv is built the way Gym builds it (`uv venv --seed --python 3.13.14`, then `uv pip install -r requirements.txt`). Torch is the CPU-only 2.11.0 wheel, pinned by URL: adding the PyTorch CPU index as an extra index breaks the resolve, because that index also hosts an old `packaging`. Pinned: `transformers 5.18.0`, `chromadb 1.5.9`, `langchain-chroma 1.1.0`, `langchain-core 1.6.6`. The venv adds about 1 GB of disk (`C:` is nearly full).
+- **Embedder.** `embeddings.py` in the server folder is copied from AutoDidact with three changes: the `langchain_core` import (the old `langchain.embeddings.base` path is gone), CPU by default, and batches of 32. The pooling is unchanged: the `[CLS]` vector for documents, mean pooling for queries.
+- **Build.** `Chroma.from_documents` over `Step2_Files/Saved_data/chunks.pkl`, with fixed ids `chunk-<index>`. It takes about 17 s, not "a couple of minutes". A non-empty output folder is refused unless `--rebuild` is given, and `--rebuild` only deletes a folder named `chroma_index`.
+- **Merge of short chunks (deviation).** The splitter cut each document element (a heading, a page ID, a caption) on its own, so 206 of 753 chunks have fewer than 50 characters (124 titles, 46 page or document IDs, 33 captions). They filled 12.9% of the top-2 search results. `merge_small_chunks` glues each chunk shorter than `--min-chars` (default 100) onto the chunk(s) after it, up to `--max-chars` (default 1500). Result: 753 chunks became 510 (186 merged groups, shortest 101 characters, longest 1089). `--min-chars 0` keeps all 753 chunks.
+- **How the threshold was chosen.** Five variants were compared on all 1,434 questions with an exact in-memory search, which matched the real index within 0.5 points. Answer coverage at top 2 / top 5: baseline 72.0 / 83.3, drop chunks under 50: 74.3 / 84.0, **merge to 100: 75.0 / 85.3**, merge to 200: 74.1 / 85.1, merge to 300: 73.2 / 84.7. Window recall at top 2 stayed flat for 100 (76.9 to 77.0) and fell for 200 (75.2) and 300 (72.2). Dropping loses content: 30 questions (2.1%) have an answer only in a tiny chunk. Not chosen: parent-child retrieval (it needs a second store and changes what the agent reads). Revisit it if the corpus grows.
+- **Chunk numbers.** `questions.json` (`chunk_id`) and the purged split use the OLD chunk positions, so neither changes. Each merged chunk stores `chunk_start`, `chunk_end` (the old positions it covers) and `n_merged`. `chunk_index` is the new position.
+- **Retrieval check** (400 questions, top 2 / top 5), before and after the merge. Window recall: 78.5 / 88.0 and 77.5 / 87.5. Centre-chunk recall: 34.0 / 46.5 and 44.2 / 57.2. Answer coverage: 73.0 / 82.0 and 75.0 / 83.8. The check asserts window recall at top 5 above 30%.
+- **Limits.** Answer coverage is a token-overlap proxy (a result holds at least 60% of the answer's key words). The centre-chunk rise is partly mechanical, because a merged chunk covers more positions. The gain is small, about 2 points. The check samples every third question and stops at 400, so it never tests the last 16% of the questions.
 
 ### 4. Resources server: `app.py` (pattern from the NeMo Gym single-step tutorial)
 - **Config:** `MissionSearchConfig(BaseResourcesServerConfig)` with `chroma_dir`, `collection_name`, `embedding_model`, `top_k=2` (the old `run_tool_calls` used 2). Set `REVERIFY_MODE = STATELESS`.
 - **Tool:** `POST /search_corpus` takes `SearchCorpusRequest{query: str}` and returns `SearchCorpusResponse{results: str}`. It reuses the `load_vectorstore` and `search` formatting logic (`search_module.py:23,49`).
+  - The index (step 3) holds 510 merged chunks. The top-2 results average about 500 characters, and each result has `chunk_start` and `chunk_end` metadata. Open the index with the same `CustomHuggingFaceEmbeddings` class from `embeddings.py`, or the query vectors do not match the stored vectors.
 - **Verify:** `MissionSearchVerifyRequest(BaseVerifyRequest)` adds `answer: str`.
   - Take the last `type=="message"` output text and strip reasoning with `remove_reasoning` (`rl_helpers.py:131`, copied).
   - Reward is 1.0 on a normalized exact or containment match, otherwise token-F1 against `answer`. It is 0.0 if there is no final message.
