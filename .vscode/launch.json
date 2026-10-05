@@ -1,0 +1,19 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug build_index (server venv)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/NeMo_Gym/resources_servers/mission_search/scripts/build_index.py",
+            "python": "${workspaceFolder}/NeMo_Gym/resources_servers/mission_search/.venv/bin/python",
+            "args": ["--out-dir", "/tmp/debug_index/chroma_index", "--rebuild"],
+            "env": {"HF_HUB_OFFLINE": "1", "TOKENIZERS_PARALLELISM": "false"},
+            "justMyCode": false,
+            "console": "integratedTerminal"
+        }
+    ]
+}
