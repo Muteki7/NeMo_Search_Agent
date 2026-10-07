@@ -7,7 +7,7 @@
 | Project | Train a small model to answer questions with a search tool |
 | Scope | Changes in approach and changes in tests |
 | Not in scope | Package problems. See `Dependency_hell.md`. |
-| Last update | 2026-10-05 |
+| Last update | 2026-10-07 |
 
 ## 1. How to read this file
 
@@ -59,6 +59,17 @@ Use the same name for the same thing every time.
 | window recall | The share of questions for which the top k results hold a chunk of the question window | hit rate |
 | centre-chunk recall | The share of questions for which the top k results hold the middle chunk of the window | exact recall |
 | answer coverage | The share of questions for which a top k result holds at least 60% of the answer key words | answer hit rate |
+| resources server | The Gym server that holds the tool and the reward. In this project it is `app.py`. | environment server |
+| head server | The Gym server on port 11000. It knows the port of each other server. | main server, registry |
+| server venv | The Python environment of the resources server: `NeMo_Gym/resources_servers/mission_search/.venv` | gym env |
+| trainer venv | The Python environment of the trainer: `trainer/temp/.venv-temp` | training env |
+| agent | The code that runs the loop: generate, call the tool, repeat. In this project it is the rollout function. | agent server |
+| reward | The number from 0 to 1 that `verify` gives to one trajectory | score, label |
+| expected answer | The text in the `answer` field of a row. An 8B model wrote it. | gold answer, label |
+| final answer | The text of the last `message` item in a trajectory, without the reasoning | last reply |
+| token F1 | A number from 0 to 1 for the words that two texts share | F-score |
+| containment | The case where the expected answer is a run of whole words inside the final answer | substring match |
+| length cap | The largest number of words in a final answer that gets 1.0 by containment | word limit |
 
 ## 3. Learnings
 
@@ -396,6 +407,89 @@ Window recall stays the same for 100. It falls for 200 and 300. So we chose 100.
 
 **Where.** `merge_small_chunks` in `NeMo_Gym/resources_servers/mission_search/scripts/build_index.py`.
 
+### L13. Score the final answer against the expected answer
+
+**Problem.** An 8B model wrote the expected answers. The words differ from the words of a correct answer from our model. An exact match gives 0 to many correct answers. A plain containment test is easy to cheat.
+
+**Cause.** The expected answers are paraphrases. Nobody checked them. A model that pastes a whole chunk into its answer always contains the expected text.
+
+**Solution.** The function `score_answer` in `app.py` gives the reward in four steps:
+
+1. Take the text of the last `message` item. If there is none, the reward is 0.0.
+2. Remove the `<reasoning>` blocks. Then lowercase the text, delete the punctuation and delete the words a, an and the. Delete the punctuation without a space, so `18:24` and `1824` are the same.
+3. Give 1.0 if the two texts are equal. Give 1.0 if the expected answer is a run of whole words in the final answer and the final answer is short.
+4. Give the token F1 in all other cases. The token F1 is 0.0 if the two texts share no word.
+
+A final answer is short if it has at most 3 x (expected words) + 10 words. For the expected answer `1824`, the limit is 13 words. For an expected answer of 6 words, the limit is 28 words. A final answer above the limit still gets a partial reward from the token F1.
+
+`verify` does not read the index and does not call a model. It is a pure function of the request body, so the reverify mode is STATELESS. The same rollout always gets the same reward.
+
+**Tests.** `tests/test_app.py` holds the checks:
+
+- The fixture has six cases: two full reward, two zero reward and two malformed.
+- A final answer with the answer only inside the reasoning gets 0.0.
+- A final answer with the answer and 40 more words gets less than 1.0.
+- The paraphrase "It was reinforced with Mylar tape" gets about 0.62 against "The Aclar will be reinforced with Mylar tape."
+
+**Choices that we did not make.**
+
+- We did not use a judge model. It breaks the STATELESS mode and costs GPU memory.
+- We did not use an exact match alone. It gives 0 to correct paraphrases.
+- We did not add a bonus for a tool call. A model calls the tool, ignores the result and still gets the bonus. Decide after the first rollouts show how often the model calls the tool. Cap such a bonus so that the total stays at or below 1.0.
+
+**What stays open.**
+
+- The numbers 3 and 10 in the length cap are a first guess. We did not measure them.
+- The expected answers are not checked. Some are wrong, or the top 2 results do not hold the answer.
+- The token F1 gives a small reward to a wrong answer that shares words with the expected answer.
+- After the first rollouts, find the questions that no attempt scores on. They show bad expected answers.
+
+**Rule.**
+
+- Make the reward a pure function of the request.
+- Test that the reward does not give 1.0 to a long answer that only contains the expected text.
+- Keep the reward from 0 to 1.
+
+**Where.** `score_answer`, `normalize` and `final_message_text` in `NeMo_Gym/resources_servers/mission_search/app.py`.
+
+### L14. Keep the resources server and the trainer in separate environments
+
+**Problem.** The Gym documents show an agent server and a model server next to the resources server. Our trainer has its own vLLM engine. We had to decide where the agent runs and which Python environment runs each part. `ng_run` also installs packages by default.
+
+**Cause.** There are three reasons:
+
+- The two stacks conflict. The server uses CPU torch and transformers 5.18. The trainer uses CUDA torch and transformers 5.17.
+- The `simple_agent` needs a model server over HTTP. That means a second vLLM engine, and the GPU has no room for it. It also works with text, so it breaks the token buffer rule (L4).
+- `ng_run` runs `uv pip install` into the server venv at each start, unless `skip_venv_if_present` is true. The code then installs `nemo-gym` from PyPI. We read this in `setup_command.py`. We did not run it.
+
+**Solution.**
+
+1. Run the resources server with `ng_run` in the server venv. Add `+skip_venv_if_present=true`. Then `ng_run` only activates the venv.
+2. Run the trainer in the trainer venv, in a second terminal. The two environments share no package. They talk over HTTP.
+3. The rollout function is the agent. It generates on the trainer engine. It sends each tool call to `POST /search_corpus` and the final answer to `POST /verify`.
+4. The trainer finds the port of the server with `GET :11000/global_config_dict_yaml`. The reply is one JSON string that holds YAML. Decode it with `json.loads` first.
+
+**What runs after the start.**
+
+| Port | What | Notes |
+|---|---|---|
+| 11000 | Head server | Fixed port. It answers `status ok` at `/`. |
+| 10001 to 20000 | Our resources server | A new random port at each start (18432 in the first run) |
+| 8265 | Ray dashboard | Ray starts with `ng_run`. Our server has `ray_enabled = False` and does not use it. |
+| 39107 | Ray cluster address | Not an HTTP page |
+
+The first start did not install anything. The embedder loaded one time at the start (199 weights). A search call returned two results, and the verify calls gave the expected rewards.
+
+**What stays open.** Ray runs but does nothing. If RAM or `/dev/shm` is short during training, run `ray stop`. We did not measure this.
+
+**Rule.**
+
+- Keep one Python environment for each stack. Never install the server packages into the trainer venv.
+- Start `ng_run` with `+skip_venv_if_present=true` after the server venv works.
+- Find the server port at run time. Never write it in the code.
+
+**Where.** `NeMo_Gym/resources_servers/mission_search/configs/resources_only.yaml`. The agent code goes in `trainer/rollout.py` (step 5).
+
 ## 4. Procedures
 
 ### 4.1 Make the data files
@@ -430,6 +524,22 @@ To use the old split, add `--split legacy`. Use the environment with the `datase
 
 The build takes about 20 s. To keep all 753 chunks, add `--min-chars 0`. To test without a change to the real index, add `--out-dir` with a new folder.
 
+### 4.4 Start the server and test it
+
+> CAUTION: Do not start `ng_run` without `+skip_venv_if_present=true`. It installs packages into the server venv.
+
+1. Go to the folder `NeMo_Gym`.
+2. Run `resources_servers/mission_search/.venv/bin/ng_run "+config_paths=[resources_servers/mission_search/configs/resources_only.yaml]" +skip_venv_if_present=true`.
+3. Wait for the line `All 1 / 1 servers ready`.
+4. Open a second terminal. The first terminal shows the log, and it does not take input.
+5. Run `curl -s localhost:11000/global_config_dict_yaml | python3 -c 'import json,sys; print(json.load(sys.stdin))'`.
+6. Find the `port` in the block `mission_search_resources_server`.
+7. Send `{"query": "gimbal angle deviations"}` to `/search_corpus`. Make sure that the reply has `Result 1:` and `Result 2:`.
+8. Send a row to `/verify` with a correct final answer. Make sure that the reward is 1.0. Use a wrong final answer. Make sure that the reward is 0.0.
+9. Press Ctrl+C in the first terminal. Use `ps` to make sure that no `app.py` process stays.
+
+To run the unit tests, go to `NeMo_Gym`. Run `resources_servers/mission_search/.venv/bin/python -m pytest resources_servers/mission_search/tests`. Make sure that all 14 tests pass.
+
 ## 5. Open items
 
 - The Llama chat template puts quotation marks around the content of a tool message. We probably do not want this for search results. Decide how to add the search results, and run the prefix check again.
@@ -438,3 +548,6 @@ The build takes about 20 s. To keep all 753 chunks, add `--min-chars 0`. To test
 - Delete the counter for the old render method after we measure it on a larger sample.
 - The retrieval test never tests the last 16% of the questions. Use a larger step, so that the sample covers the whole file.
 - `Debug_checks.md` and the pictures in `Schema_learning` show the index before the merge (753 chunks and the old line numbers). Update them before the next debug session.
+- Check the expected answers. After the first rollouts, find the questions that no attempt scores on. Read them with their chunks.
+- Measure the length cap (3 x expected words + 10). Look at the final answers that get 1.0 by containment.
+- Decide on a bonus for a tool call after the first rollouts show how often the model calls the tool.

@@ -93,16 +93,25 @@ Script: `NeMo_Gym/resources_servers/mission_search/scripts/build_index.py`. Run 
 - **Retrieval check** (400 questions, top 2 / top 5), before and after the merge. Window recall: 78.5 / 88.0 and 77.5 / 87.5. Centre-chunk recall: 34.0 / 46.5 and 44.2 / 57.2. Answer coverage: 73.0 / 82.0 and 75.0 / 83.8. The check asserts window recall at top 5 above 30%.
 - **Limits.** Answer coverage is a token-overlap proxy (a result holds at least 60% of the answer's key words). The centre-chunk rise is partly mechanical, because a merged chunk covers more positions. The gain is small, about 2 points. The check samples every third question and stops at 400, so it never tests the last 16% of the questions.
 
-### 4. Resources server: `app.py` (pattern from the NeMo Gym single-step tutorial)
-- **Config:** `MissionSearchConfig(BaseResourcesServerConfig)` with `chroma_dir`, `collection_name`, `embedding_model`, `top_k=2` (the old `run_tool_calls` used 2). Set `REVERIFY_MODE = STATELESS`.
-- **Tool:** `POST /search_corpus` takes `SearchCorpusRequest{query: str}` and returns `SearchCorpusResponse{results: str}`. It reuses the `load_vectorstore` and `search` formatting logic (`search_module.py:23,49`).
-  - The index (step 3) holds 510 merged chunks. The top-2 results average about 500 characters, and each result has `chunk_start` and `chunk_end` metadata. Open the index with the same `CustomHuggingFaceEmbeddings` class from `embeddings.py`, or the query vectors do not match the stored vectors.
-- **Verify:** `MissionSearchVerifyRequest(BaseVerifyRequest)` adds `answer: str`.
-  - Take the last `type=="message"` output text and strip reasoning with `remove_reasoning` (`rl_helpers.py:131`, copied).
-  - Reward is 1.0 on a normalized exact or containment match, otherwise token-F1 against `answer`. It is 0.0 if there is no final message.
-  - Return `BaseVerifyResponse(**body.model_dump(), reward=...)`.
-- **Configs:** `mission_search.yaml` (resources server plus a `simple_agent` entry for later `gym eval run`) and `resources_only.yaml` (used for training, as in the notebook).
-- **Tests:** a `VerifierFixture` with `verifier_cases.jsonl` (full, zero, and malformed cases), plus a unit test of `search_corpus`.
+### 4. Resources server: `app.py`: DONE
+Files: `NeMo_Gym/resources_servers/mission_search/app.py`, `configs/resources_only.yaml`, `tests/test_app.py`, `tests/verifier_cases.jsonl`. Status (2026-10-07): 14 tests pass in the server venv, the server starts with `ng_run`, and the search call and the verify calls gave the expected results.
+- **Config.** `MissionSearchResourcesServerConfig` has `chroma_dir` (default `chroma_index`, relative to the server folder), `collection_name` (`example_collection`), `embedding_model` and `top_k=2`. `REVERIFY_MODE` is STATELESS: `verify` never reads the index, so it is a pure function of the request body.
+- **Tool.** `POST /search_corpus` takes `{query}` and returns `{results}`. `CorpusSearcher` opens the index once at server start with the same `CustomHuggingFaceEmbeddings` class that built it. The text format is the AutoDidact format (`Result i:`, the chunk text, `------`). The route name equals the tool name in the data rows, because the agent POSTs each tool call to `/{tool name}`. The embedding runs in a thread (`asyncio.to_thread`), so parallel rollouts do not block the server.
+  - Deviation: `search_module.py` is not imported. It loads its own index at import time with old paths and `results=5`. Only its output format is copied.
+- **Verify.** `MissionSearchVerifyRequest` adds `answer: str`. The scaffold had `expected_answer`, but the data rows use `answer`. The final answer is the last `message` item of the response output. `<reasoning>` blocks are removed, then both texts are normalized (lowercase, no punctuation, no articles, so `18:24` equals `1824`). Reward:
+  - 1.0 for an exact match, or when the expected answer is a run of whole words inside a short answer.
+  - Otherwise the token-F1 between the two texts.
+  - 0.0 when there is no final message or no text is left after the reasoning is removed.
+- **Containment cap (deviation).** "Short" means at most 3 x (expected words) + 10 words (`app.py`, `score_answer`). Without a cap, a model could paste a whole chunk and get 1.0. The numbers 3 and 10 are a first guess. They are not measured.
+- **No tool-call bonus (deviation).** Decide after the first rollouts show how often the base model calls the tool. Add a small bonus, capped so that the total stays at or below 1.0, only if almost no sample calls the tool.
+- **Where the expected answers come from.** An 8B model wrote them from three-chunk windows (`generate_data.py`). Nobody checked them. A correct answer in other words scores below 1.0. See `Learnings.md` L13.
+- **Configs.** `mission_search.yaml` keeps the resources server and the `simple_agent` entry. It cannot start alone, because `simple_agent` needs a `policy_model` that we do not have. Use it later for `gym eval run` with a model endpoint. `resources_only.yaml` has only the resources server, with no agent and no datasets. It is the file for training.
+- **Where the agent and the trainer live (deviation from the Gym layout).** There is no agent server. `rollout_func` in the trainer (step 5) is the agent: it generates on the trainer's own vLLM engine, POSTs tool calls to `/search_corpus`, and the answer to `/verify`. `simple_agent` would need a second vLLM engine and works on text, so it breaks the single-engine gate and the TITO rule. The trainer lives in `trainer/` and is not a Gym server.
+- **Two environments.** The server runs in `NeMo_Gym/resources_servers/mission_search/.venv`. The trainer runs in `trainer/temp/.venv-temp`. They share no packages (CPU against CUDA torch, transformers 5.18 against 5.17) and only talk over HTTP.
+- **Start the server** (from `NeMo_Gym`): `resources_servers/mission_search/.venv/bin/ng_run "+config_paths=[resources_servers/mission_search/configs/resources_only.yaml]" +skip_venv_if_present=true`. Without the flag, `ng_run` runs `uv pip install` into the existing server venv and installs `nemo-gym` from PyPI. That could break the pins. With the flag, it only activates the venv.
+- **Ports.** The head server is fixed at 11000. Our server gets a random port in 10001-20000 at each start. The trainer finds it with `GET :11000/global_config_dict_yaml`. The reply is one JSON string that holds YAML, so decode it with `json.loads` first. Ray (dashboard 8265, cluster 39107) also starts, but our server has `ray_enabled = False` and does not use it.
+- **Tests.** `verifier_cases.jsonl` has six cases: two full reward, two zero reward and two malformed (no `response`, no `answer`). `test_app.py` also tests the scoring rules (partial F1, the length cap, reasoning-only answers, the last message) and the search tool (output format, `top_k`, parallel searches give the same text). The search tests skip if the index is missing.
+- **Retrieval limit seen here.** For the example question ("What time was the flotation collar inflated?") the only chunk that mentions the collar is not in the top 5. A 60-question check gave window recall 77% at top 2 and 90% at top 5. Some questions need a reworded query. That is the behaviour that training should find.
 
 ### 5. Trainer: `rollout.py` + `train_grpo.py`
 - **Gym client:** discover server host/port from the head server's `GET :11000/global_config_dict_yaml`. Copy the pattern from `Example_NeMo.ipynb` cell 7.
@@ -125,8 +134,8 @@ Script: `NeMo_Gym/resources_servers/mission_search/scripts/build_index.py`. Run 
 - **`eval.py`:** run `validation.jsonl` through the same loop, with and without the trained LoRA, and report mean reward. This replaces `run_eval` and notebook cells 9-10.
 
 ## Verification
-1. Run `gym env test --resources-server mission_search` (verifier fixture plus tool test).
-2. Start `ng_run "+config_paths=[resources_servers/mission_search/configs/resources_only.yaml]"`, then `curl` both `/search_corpus` (should return 2 chunks) and `/verify` with a hand-built correct and incorrect response (expect 1.0 and ~0.0).
+1. From `NeMo_Gym`, run `resources_servers/mission_search/.venv/bin/python -m pytest resources_servers/mission_search/tests` (verifier fixture plus tool tests): done, 14 pass.
+2. Start `ng_run "+config_paths=[resources_servers/mission_search/configs/resources_only.yaml]" +skip_venv_if_present=true`, then `curl` both `/search_corpus` (should return 2 chunks) and `/verify` with a hand-built correct and incorrect response (expect 1.0 and ~0.0): done.
 3. Step-1 spike: done, all checks pass (see step 1). Re-run it after any change to the rollout loop.
 4. Smoke-train `train_grpo.py` with `max_steps=5`: rewards are non-zero, no OOM, and logged completions show `search_corpus` calls with `ipython` results.
 5. Full run (101 steps, as before), then `eval.py` comparing base vs. LoRA mean reward on the validation split.
