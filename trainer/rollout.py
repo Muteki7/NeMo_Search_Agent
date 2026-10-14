@@ -341,6 +341,29 @@ def make_rollout_func(client: GymClient, lora_name: str, max_turns: int = 5, max
 
 
 # ---------------------------------------------------------------------------------------------------------------
+# Dump: one JSON line for each trajectory, to read the outputs and to re-score them offline
+# ---------------------------------------------------------------------------------------------------------------
+def final_text(trajectory: dict) -> Optional[str]:
+    """Text of the last `message` item of a trajectory, or None if it has no final message."""
+    messages = [i for i in trajectory["output"] if i["type"] == "message"]
+    return messages[-1]["content"][0]["text"] if messages else None
+
+
+def trajectory_record(prompt_messages: list, answer: str, trajectory: dict, reward: float, **extra) -> dict:
+    """One dump line. `question` is the text after the last "Question:" in the last user message."""
+    user = next((m["content"] for m in reversed(prompt_messages) if m["role"] == "user"), "")
+    return {**extra, "question": user.rsplit("Question:", 1)[-1].strip(), "answer": answer, "ended": trajectory["ended"],
+            "n_tool_calls": trajectory["n_tool_calls"], "n_turns": trajectory["n_turns"], "reward": reward,
+            "final_text": final_text(trajectory), "output": trajectory["output"]}
+
+
+def append_jsonl(path, records: list) -> None:
+    with open(path, "a", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+# ---------------------------------------------------------------------------------------------------------------
 # Reward: ask /verify
 # ---------------------------------------------------------------------------------------------------------------
 def build_response(output_items: list) -> dict:
@@ -349,7 +372,10 @@ def build_response(output_items: list) -> dict:
             "parallel_tool_calls": False, "tool_choice": "auto", "tools": []}
 
 
-def make_gym_verify_reward(client: GymClient, max_workers: int = 16):
+def make_gym_verify_reward(client: GymClient, max_workers: int = 16, dump_path=None):
+    """`dump_path`: if set, every trajectory is appended there with its reward (see `trajectory_record`)."""
+    calls = {"n": 0}
+
     def gym_verify_reward(prompts, completions, trajectory, answer, responses_create_params=None, **kwargs):
         """One reward for each trajectory. TRL passes the dataset columns `answer` and `responses_create_params`
         and the `trajectory` field that rollout_func returned."""
@@ -360,6 +386,11 @@ def make_gym_verify_reward(client: GymClient, max_workers: int = 16):
             return float(client.post("/verify", body)["reward"])
 
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            return list(pool.map(one, range(len(prompts))))
+            rewards = list(pool.map(one, range(len(prompts))))
+        if dump_path:
+            calls["n"] += 1
+            append_jsonl(dump_path, [trajectory_record(prompts[i], answer[i], trajectory[i], rewards[i],
+                                                       reward_call=calls["n"], index=i) for i in range(len(prompts))])
+        return rewards
 
     return gym_verify_reward

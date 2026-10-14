@@ -86,7 +86,7 @@ def greedy_ids(eng, text, lora_request):
         temperature=0.0: Forces Greedy Decoding (pick highes probability token, making output 100% deterministic)
         max_tokens=32 : Limits generated output length to at most 32 tokens
     
-        out = eng.generated(..): Passes hte prompt text into the inference engine (eng), applying specified dynamic
+        out = eng.generated(..): Passes the prompt text into the inference engine (eng), applying specified dynamic
         LoRA adapter (lora_request) to process the request.
 
         return list(..): Extracts an array of generated token ID integers([1024, 882, 319..]) from first completion

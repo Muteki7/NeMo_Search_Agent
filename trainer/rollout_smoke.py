@@ -20,7 +20,7 @@ import sys
 
 from train_grpo import (LORA_NAME, MAX_COMPLETION, MAX_NEW, MAX_TURNS, MODEL, NUM_GEN, build_trainer, load_dataset,
                         load_model)
-from rollout import GymClient, make_gym_verify_reward, make_rollout_func
+from rollout import GymClient, append_jsonl, final_text, make_gym_verify_reward, make_rollout_func, trajectory_record
 
 RESULTS = {}
 
@@ -45,11 +45,6 @@ def render_masked(tok, comp, mask):
     return "\n".join(parts)
 
 
-def final_text(trajectory):
-    messages = [i for i in trajectory["output"] if i["type"] == "message"]
-    return messages[-1]["content"][0]["text"] if messages else None
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=MODEL)
@@ -57,6 +52,7 @@ def main():
     ap.add_argument("--n-questions", type=int, default=8, help="different questions; each gets NUM_GEN attempts")
     ap.add_argument("--split", default="validation")
     ap.add_argument("--show", type=int, default=1, help="how many full trajectories to print")
+    ap.add_argument("--dump", default="smoke_dump.jsonl", help="write every trajectory with its reward here (overwritten)")
     args = ap.parse_args()
 
     client = GymClient.discover()
@@ -101,6 +97,11 @@ def main():
     rewards = make_gym_verify_reward(client)(prompts=prompts, completions=[None] * n, trajectory=out["trajectory"],
                                              answer=answers, responses_create_params=rcps)
     check("rewards_from_real_verify", len(rewards) == n and all(0.0 <= r <= 1.0 for r in rewards))
+
+    open(args.dump, "w").close()
+    append_jsonl(args.dump, [trajectory_record(prompts[i], answers[i], out["trajectory"][i], rewards[i],
+                                               group=i // NUM_GEN, attempt=i % NUM_GEN) for i in range(n)])
+    print(f"[smoke] wrote {n} trajectories to {args.dump}")
 
     print("\n[smoke] one line for each trajectory: group.attempt ended n_calls turns tokens reward | final answer")
     for i, (t, r) in enumerate(zip(out["trajectory"], rewards)):

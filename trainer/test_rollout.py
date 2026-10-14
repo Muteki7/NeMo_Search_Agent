@@ -247,6 +247,22 @@ def test_reward_function_builds_the_verify_request():
     assert set(body["response"]) >= {"id", "created_at", "model", "object", "output", "tools", "tool_choice"}
 
 
+def test_reward_function_writes_the_dump(tmp_path=None):
+    import os, tempfile
+    class FakeClient:
+        def post(self, path, body):
+            return {"reward": 0.5}
+    path = os.path.join(tempfile.mkdtemp(), "dump.jsonl")
+    out, _, _ = rollout_for({"What time was it?": [(CALL % "a", "stop"), ("It is 1824.", "stop")]})
+    user_prompt = [{"role": "user", "content": "instructions...\n\nQuestion: What time was it?\n"}]
+    make_gym_verify_reward(FakeClient(), dump_path=path)(
+        prompts=[user_prompt], completions=[None], trajectory=out["trajectory"], answer=["1824"])
+    line = json.loads(open(path, encoding="utf-8").readline())
+    assert line["question"] == "What time was it?" and line["answer"] == "1824" and line["reward"] == 0.5
+    assert line["final_text"] == "It is 1824." and line["ended"] == "answer" and line["n_tool_calls"] == 1
+    assert [i["type"] for i in line["output"]] == ["function_call", "function_call_output", "message"]
+
+
 # ---- 6. live tests: need `ng_run` with resources_only.yaml -----------------------------------------------------
 def live_search_and_verify_end_to_end():
     client = GymClient.discover()
