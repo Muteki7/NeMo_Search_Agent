@@ -1,0 +1,12 @@
+-e nemo-gym[dev] @ ../../Gym
+
+# Embedding model for the search tool. CPU-only torch (about 190 MB) keeps the GPU free for training and avoids
+# the multi-GB CUDA packages. It is pinned by URL on purpose: the PyTorch CPU index also hosts an old `packaging`,
+# so adding it as an extra index breaks the resolve. Linux x86_64, Python 3.13 only.
+torch @ https://download.pytorch.org/whl/cpu/torch-2.11.0%2Bcpu-cp313-cp313-manylinux_2_28_x86_64.whl
+transformers==5.18.0
+
+# Vector store (versions pinned: the index files must be readable by the same chromadb that built them).
+chromadb==1.5.9
+langchain-chroma==1.1.0
+langchain-core==1.6.6

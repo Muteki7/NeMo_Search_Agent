@@ -13,6 +13,10 @@ How the pieces fit (see Plan.md step 5 and Learnings.md L4, L5, L13, L14):
 This file must not import unsloth or vllm at module level, so that the tests run on the CPU.
 """
 import json
+import re
+import string
+import subprocess
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -306,9 +310,36 @@ def run_rollout(prompts, tok, generate_fn: Callable, call_tool: Callable, max_tu
 # ---------------------------------------------------------------------------------------------------------------
 # Wiring to Unsloth / TRL / vLLM (tested in Test 2, not in Test 1)
 # ---------------------------------------------------------------------------------------------------------------
+def vram_used_mib() -> Optional[int]:
+    """GPU memory in use (all programs), from nvidia-smi. None if it cannot be read."""
+    try:
+        out = subprocess.check_output(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"])
+        return int(out.decode().strip().splitlines()[0])
+    except Exception:
+        return None
+
+
+def make_vllm_generate_fn(eng, sampling_params, lora_request=None) -> Callable:
+    """A generate_fn for run_rollout on a vLLM engine: token ids in, sampled token ids and their logprobs out.
+    `lora_request=None` runs the base model (no adapter)."""
+    def generate_fn(id_lists):
+        outs = eng.generate([{"prompt_token_ids": ids} for ids in id_lists], sampling_params, use_tqdm=False,
+                            lora_request=lora_request)
+        results = []
+        for out in outs:
+            o = out.outputs[0]
+            ids = list(o.token_ids)
+            lps = [(d[t].logprob if t in d else list(d.values())[0].logprob) if d else 0.0
+                   for t, d in zip(ids, o.logprobs or [None] * len(ids))]
+            results.append(GenOut(ids, lps, o.text, o.finish_reason, list(out.prompt_token_ids)))
+        return results
+    return generate_fn
+
+
 def make_rollout_func(client: GymClient, lora_name: str, max_turns: int = 5, max_new_tokens: int = 256,
                       max_completion_tokens: Optional[int] = None, temperature: float = 0.9, top_p: float = 0.95):
-    """Build the `rollout_func(prompts, trainer)` that GRPOTrainer calls. It returns one trajectory per prompt."""
+    """Build the `rollout_func(prompts, trainer)` that GRPOTrainer calls. It returns one trajectory per prompt.
+    Set the GRPOConfig `temperature` to the same value: TRL divides its own logits by it."""
     from vllm import SamplingParams  # imported here so that the CPU tests do not need vllm
 
     def rollout_func(prompts, trainer):
@@ -317,27 +348,44 @@ def make_rollout_func(client: GymClient, lora_name: str, max_turns: int = 5, max
         startup_checks(tok)
         lora = trainer.model.load_lora(lora_name, load_tensors=True)   # a fresh handle at each step: the weights changed
         sp = SamplingParams(temperature=temperature, top_p=top_p, max_tokens=max_new_tokens, logprobs=0)
-
-        def generate_fn(id_lists):
-            outs = eng.generate([{"prompt_token_ids": ids} for ids in id_lists], sp, use_tqdm=False, lora_request=lora)
-            results = []
-            for out in outs:
-                o = out.outputs[0]
-                ids = list(o.token_ids)
-                lps = [(d[t].logprob if t in d else list(d.values())[0].logprob) if d else 0.0
-                       for t, d in zip(ids, o.logprobs or [None] * len(ids))]
-                results.append(GenOut(ids, lps, o.text, o.finish_reason, list(out.prompt_token_ids)))
-            return results
-
-        result = run_rollout(prompts, tok, generate_fn, client.call_tool, max_turns=max_turns,
+        result = run_rollout(prompts, tok, make_vllm_generate_fn(eng, sp, lora), client.call_tool, max_turns=max_turns,
                              max_completion_tokens=max_completion_tokens, max_new_tokens=max_new_tokens)
         stats = result.pop("stats")
+        stats["vram_mib"] = vram_used_mib()
         rollout_func.last_stats = stats
         print("[rollout] " + " ".join(f"{k}={v:.2f}" if isinstance(v, float) else f"{k}={v}" for k, v in stats.items()))
         return result
 
     rollout_func.last_stats = None
     return rollout_func
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Answer text helpers (for eval.py). The same normalization as app.py in the server: the two venvs cannot import each
+# other, so keep them in sync. They do not decide the reward (the server does), only the extra eval metrics.
+# ---------------------------------------------------------------------------------------------------------------
+_PUNCTUATION = str.maketrans("", "", string.punctuation)
+
+
+def remove_reasoning(text: str) -> str:
+    return re.sub(r"<reasoning>.*?</reasoning>", "", text, flags=re.DOTALL)
+
+
+def normalize_text(text: str) -> str:
+    """Lowercase, delete punctuation (without a space: `18:24` equals `1824`), delete a/an/the, collapse spaces."""
+    text = re.sub(r"\b(a|an|the)\b", " ", text.lower().translate(_PUNCTUATION))
+    return " ".join(text.split())
+
+
+def answer_words(final_text: Optional[str]) -> list:
+    """The words of a final answer without the reasoning."""
+    return normalize_text(remove_reasoning(final_text or "")).split()
+
+
+def contains_answer(final_text: Optional[str], expected: str) -> bool:
+    """True if the expected answer is a run of whole words in the final answer. Ignores the length cap of the reward."""
+    haystack, needle = answer_words(final_text), normalize_text(expected).split()
+    return bool(needle) and any(haystack[i:i + len(needle)] == needle for i in range(len(haystack) - len(needle) + 1))
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -363,6 +411,28 @@ def append_jsonl(path, records: list) -> None:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
+def checkpoint_step(checkpoint_dir) -> int:
+    """The optimizer step of a TRL checkpoint folder (`global_step` in trainer_state.json)."""
+    with open(Path(checkpoint_dir) / "trainer_state.json", encoding="utf-8") as f:
+        return int(json.load(f)["global_step"])
+
+
+def prune_dump_after_step(dump_path, step: int) -> int:
+    """Before a resume: the steps after the checkpoint will be run again, so move their dump lines into
+    `<dump>.dropped_after_step<step>.jsonl` (appended, never deleted). Returns the number of lines moved."""
+    path = Path(dump_path)
+    if not path.exists():
+        return 0
+    lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    keep = [line for line in lines if json.loads(line)["step"] <= step]
+    drop = [line for line in lines if json.loads(line)["step"] > step]
+    if drop:
+        with open(path.with_name(path.name + f".dropped_after_step{step}.jsonl"), "a", encoding="utf-8") as f:
+            f.write("".join(line + "\n" for line in drop))
+        path.write_text("".join(line + "\n" for line in keep), encoding="utf-8")
+    return len(drop)
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # Reward: ask /verify
 # ---------------------------------------------------------------------------------------------------------------
@@ -372,9 +442,10 @@ def build_response(output_items: list) -> dict:
             "parallel_tool_calls": False, "tool_choice": "auto", "tools": []}
 
 
-def make_gym_verify_reward(client: GymClient, max_workers: int = 16, dump_path=None):
-    """`dump_path`: if set, every trajectory is appended there with its reward (see `trajectory_record`)."""
-    calls = {"n": 0}
+def make_gym_verify_reward(client: GymClient, max_workers: int = 16, dump_path=None, step_offset: int = 0):
+    """`dump_path`: if set, every trajectory is appended there with its reward (see `trajectory_record`).
+    TRL calls the reward once for each rollout, so `step` counts the optimizer steps of this run."""
+    calls = {"n": step_offset}   # after a resume, the steps continue from the checkpoint step
 
     def gym_verify_reward(prompts, completions, trajectory, answer, responses_create_params=None, **kwargs):
         """One reward for each trajectory. TRL passes the dataset columns `answer` and `responses_create_params`
@@ -390,7 +461,7 @@ def make_gym_verify_reward(client: GymClient, max_workers: int = 16, dump_path=N
         if dump_path:
             calls["n"] += 1
             append_jsonl(dump_path, [trajectory_record(prompts[i], answer[i], trajectory[i], rewards[i],
-                                                       reward_call=calls["n"], index=i) for i in range(len(prompts))])
+                                                       step=calls["n"], index=i) for i in range(len(prompts))])
         return rewards
 
     return gym_verify_reward

@@ -14,8 +14,9 @@ import traceback
 from functools import lru_cache
 
 import rollout
-from rollout import (GenOut, GymClient, GymError, build_response, make_gym_verify_reward, parse_turn, run_rollout,
-                     startup_checks, tool_delta_ids)
+from rollout import (GenOut, GymClient, GymError, build_response, checkpoint_step, contains_answer, make_gym_verify_reward,
+                     make_vllm_generate_fn, normalize_text, parse_turn, prune_dump_after_step, run_rollout, startup_checks,
+                     tool_delta_ids)
 from prompting import apply_chat_template
 
 MODEL = "unsloth/Llama-3.2-1B-Instruct"   # only its tokenizer and chat template are used
@@ -259,8 +260,78 @@ def test_reward_function_writes_the_dump(tmp_path=None):
         prompts=[user_prompt], completions=[None], trajectory=out["trajectory"], answer=["1824"])
     line = json.loads(open(path, encoding="utf-8").readline())
     assert line["question"] == "What time was it?" and line["answer"] == "1824" and line["reward"] == 0.5
-    assert line["final_text"] == "It is 1824." and line["ended"] == "answer" and line["n_tool_calls"] == 1
+    assert line["final_text"] == "It is 1824." and line["ended"] == "answer" and line["n_tool_calls"] == 1 and line["step"] == 1
     assert [i["type"] for i in line["output"]] == ["function_call", "function_call_output", "message"]
+
+
+# ---- 5b. eval helpers and the vLLM wrapper (fake engine) ----------------------------------------------------
+def test_answer_text_helpers_match_the_server_rules():
+    assert normalize_text("The  Aclar, will be!") == "aclar will be" and normalize_text("18:24") == normalize_text("1824")
+    assert contains_answer("<reasoning>maybe 1900</reasoning>The time was 18:24.", "1824")
+    assert not contains_answer("<reasoning>The time was 18:24.</reasoning>", "1824")     # only inside the reasoning
+    assert not contains_answer(None, "1824") and not contains_answer("1824", "")
+    assert not contains_answer("fuel cell 20", "fuel cell 2")                            # whole words only
+
+
+def test_vllm_generate_fn_converts_outputs_and_passes_the_adapter():
+    from types import SimpleNamespace as NS
+    seen = {}
+
+    class FakeEngine:
+        def generate(self, inputs, sampling_params, use_tqdm, lora_request):
+            seen.update(inputs=inputs, sp=sampling_params, lora=lora_request, tqdm=use_tqdm)
+            o = NS(token_ids=[11, 12, 13], text="hi", finish_reason="stop",
+                   logprobs=[{11: NS(logprob=-0.1), 99: NS(logprob=-2.0)}, {12: NS(logprob=-0.2)}, None])
+            return [NS(outputs=[o], prompt_token_ids=inputs[0]["prompt_token_ids"])]
+
+    out = make_vllm_generate_fn(FakeEngine(), "SP", "LORA")([[1, 2, 3]])[0]
+    assert out.token_ids == [11, 12, 13] and out.logprobs == [-0.1, -0.2, 0.0]    # the sampled token's own logprob
+    assert out.text == "hi" and out.finish_reason == "stop" and out.prompt_token_ids == [1, 2, 3]
+    assert seen["inputs"] == [{"prompt_token_ids": [1, 2, 3]}] and seen["lora"] == "LORA" and seen["tqdm"] is False
+
+
+# ---- 5c. resume helpers --------------------------------------------------------------------------------------
+def test_dump_steps_continue_after_a_resume():
+    import os, tempfile
+
+    class FakeClient:
+        def post(self, path, body):
+            return {"reward": 0.0}
+
+    path = os.path.join(tempfile.mkdtemp(), "dump.jsonl")
+    out, _, _ = rollout_for({"Q": [("It is 1.", "stop")]})
+    reward = make_gym_verify_reward(FakeClient(), dump_path=path, step_offset=100)
+    for _ in range(2):
+        reward(prompts=[messages("Q")], completions=[None], trajectory=out["trajectory"], answer=["1"])
+    steps = [json.loads(line)["step"] for line in open(path, encoding="utf-8")]
+    assert steps == [101, 102], steps
+
+
+def test_prune_moves_later_steps_aside_and_never_deletes():
+    import os, tempfile
+    folder = tempfile.mkdtemp()
+    path = os.path.join(folder, "train_dump.jsonl")
+    assert prune_dump_after_step(path, 3) == 0                      # no file yet: nothing to do
+    with open(path, "w", encoding="utf-8") as f:
+        for step in (1, 1, 2, 3, 4, 4, 5):
+            f.write(json.dumps({"step": step, "reward": 0.5}) + "\n")
+    assert prune_dump_after_step(path, 3) == 3                      # steps 4, 4, 5
+    assert [json.loads(l)["step"] for l in open(path)] == [1, 1, 2, 3]
+    aside = os.path.join(folder, "train_dump.jsonl.dropped_after_step3.jsonl")
+    assert [json.loads(l)["step"] for l in open(aside)] == [4, 4, 5]
+    assert prune_dump_after_step(path, 3) == 0                      # a second call changes nothing
+    assert len(open(path).readlines()) == 4 and len(open(aside).readlines()) == 3
+
+
+def test_checkpoint_step_reads_trainer_state():
+    import os, tempfile
+    folder = tempfile.mkdtemp()
+    with open(os.path.join(folder, "trainer_state.json"), "w") as f:
+        json.dump({"global_step": 7, "log_history": []}, f)
+    assert checkpoint_step(folder) == 7
+    real = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs", "20261014-124347_test", "checkpoint-2")
+    if os.path.isdir(real):                                         # the checkpoint from the 4-step test run
+        assert checkpoint_step(real) == 2
 
 
 # ---- 6. live tests: need `ng_run` with resources_only.yaml -----------------------------------------------------

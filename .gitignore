@@ -1,3 +1,18 @@
-NeMo_Gym/
 Step2_Files/
 temp/
+
+# NeMo Gym: track our own server (NeMo_Gym/resources_servers/mission_search), not the NVIDIA clone, run outputs or caches
+NeMo_Gym/Gym/
+NeMo_Gym/outputs/
+NeMo_Gym/.pytest_cache/
+# rebuilt from the chunks by scripts/build_index.py
+NeMo_Gym/resources_servers/mission_search/chroma_index/
+
+# training runs: each checkpoint is about 1 GB
+trainer/runs/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/

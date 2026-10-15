@@ -1,8 +1,8 @@
 """Test 2: run `rollout_func` alone on the real vLLM engine, the real LoRA handle and the live Gym server. No training.
 
 Needs: `ng_run` running with resources_only.yaml (Learnings.md procedure 4.4) and a free GPU.
-    cd trainer && temp/.venv-temp/bin/python rollout_smoke.py                    # 8 questions x 4 attempts, 1B model
-    temp/.venv-temp/bin/python rollout_smoke.py --n-questions 32 --show 3       # bigger sample, print 3 trajectories
+    cd trainer && temp/.venv-temp/bin/python rollout_smoke.py                    # 4 questions x 8 attempts, 8B model
+    temp/.venv-temp/bin/python rollout_smoke.py --n-questions 16 --show 3       # bigger sample, print 3 trajectories
 
 What it does:
   1. Finds the server through the head server and checks that the search tool answers.
@@ -18,8 +18,8 @@ import math
 import subprocess
 import sys
 
-from train_grpo import (LORA_NAME, MAX_COMPLETION, MAX_NEW, MAX_TURNS, MODEL, NUM_GEN, build_trainer, load_dataset,
-                        load_model)
+from train_grpo import (LORA_NAME, MAX_COMPLETION, MAX_NEW, MAX_TURNS, MODEL, NUM_GEN, TEMPERATURE, TOP_P, build_trainer,
+                        load_dataset, load_model)
 from rollout import GymClient, append_jsonl, final_text, make_gym_verify_reward, make_rollout_func, trajectory_record
 
 RESULTS = {}
@@ -48,8 +48,8 @@ def render_masked(tok, comp, mask):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=MODEL)
-    ap.add_argument("--gpu-util", type=float, default=0.4)
-    ap.add_argument("--n-questions", type=int, default=8, help="different questions; each gets NUM_GEN attempts")
+    ap.add_argument("--gpu-util", type=float, default=0.55)
+    ap.add_argument("--n-questions", type=int, default=4, help="different questions; each gets NUM_GEN attempts")
     ap.add_argument("--split", default="validation")
     ap.add_argument("--show", type=int, default=1, help="how many full trajectories to print")
     ap.add_argument("--dump", default="smoke_dump.jsonl", help="write every trajectory with its reward here (overwritten)")
@@ -75,7 +75,7 @@ def main():
     n = len(prompts)
 
     rollout_func = make_rollout_func(client, LORA_NAME, max_turns=MAX_TURNS, max_new_tokens=MAX_NEW,
-                                     max_completion_tokens=MAX_COMPLETION)
+                                     max_completion_tokens=MAX_COMPLETION, temperature=TEMPERATURE, top_p=TOP_P)
     out = rollout_func(prompts, trainer)
     stats = rollout_func.last_stats
 

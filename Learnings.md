@@ -418,9 +418,9 @@ Window recall stays the same for 100. It falls for 200 and 300. So we chose 100.
 1. Take the text of the last `message` item. If there is none, the reward is 0.0.
 2. Remove the `<reasoning>` blocks. Then lowercase the text, delete the punctuation and delete the words a, an and the. Delete the punctuation without a space, so `18:24` and `1824` are the same.
 3. Give 1.0 if the two texts are equal. Give 1.0 if the expected answer is a run of whole words in the final answer and the final answer is short.
-4. Give the token F1 in all other cases. The token F1 is 0.0 if the two texts share no word.
+4. Give the token F1 in all other cases. The token F1 counts only content words: it drops small words such as of, to and was. It is 0.0 if the two texts share no content word.
 
-A final answer is short if it has at most 3 x (expected words) + 10 words. For the expected answer `1824`, the limit is 13 words. For an expected answer of 6 words, the limit is 28 words. A final answer above the limit still gets a partial reward from the token F1.
+A final answer is short if it has at most 5 x (expected words) + 15 words. For the expected answer `1824`, the limit is 20 words. For an expected answer of 6 words, the limit is 45 words. The first limit was 3 x + 10. In a dump of 40 trajectories, two correct but wordy answers got only 0.29 and 0.35 with that limit. With 5 x + 15, the mean reward moved from 0.200 to 0.234, the same as with no limit at all. Do not change the limit during a run: the base model and the trained model need the same value. A final answer above the limit still gets a partial reward from the token F1.
 
 `verify` does not read the index and does not call a model. It is a pure function of the request body, so the reverify mode is STATELESS. The same rollout always gets the same reward.
 
@@ -439,9 +439,9 @@ A final answer is short if it has at most 3 x (expected words) + 10 words. For t
 
 **What stays open.**
 
-- The numbers 3 and 10 in the length cap are a first guess. We did not measure them.
+- The numbers 5 and 15 in the length cap come from 40 trajectories of one model. Check them again on a larger dump.
 - The expected answers are not checked. Some are wrong, or the top 2 results do not hold the answer.
-- The token F1 gives a small reward to a wrong answer that shares words with the expected answer.
+- The token F1 gives a small reward to a wrong answer that shares content words with the expected answer. In the first smoke run (1B model), the F1 on all words gave the highest rewards to non-answers. We changed it to content words. A bad tool call whose query repeats words of the question still gets a little reward.
 - After the first rollouts, find the questions that no attempt scores on. They show bad expected answers.
 
 **Rule.**
@@ -549,5 +549,5 @@ To run the unit tests, go to `NeMo_Gym`. Run `resources_servers/mission_search/.
 - The retrieval test never tests the last 16% of the questions. Use a larger step, so that the sample covers the whole file.
 - `Debug_checks.md` and the pictures in `Schema_learning` show the index before the merge (753 chunks and the old line numbers). Update them before the next debug session.
 - Check the expected answers. After the first rollouts, find the questions that no attempt scores on. Read them with their chunks.
-- Measure the length cap (3 x expected words + 10). Look at the final answers that get 1.0 by containment.
+- Measure the length cap (5 x expected words + 15) on a larger dump. Look at the final answers that get 1.0 by containment.
 - Decide on a bonus for a tool call after the first rollouts show how often the model calls the tool.

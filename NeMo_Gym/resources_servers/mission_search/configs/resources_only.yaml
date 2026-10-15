@@ -1,0 +1,13 @@
+# Resources server only: no agent and no model server. The trainer (trainer/rollout.py, step 5) acts as the agent:
+# it generates with its own vLLM, POSTs each tool call to /search_corpus and the final answer to /verify.
+# The datasets are not declared here: the trainer reads data/train.jsonl directly.
+# Start:  cd NeMo_Gym && resources_servers/mission_search/.venv/bin/ng_run "+config_paths=[resources_servers/mission_search/configs/resources_only.yaml]"
+mission_search_resources_server:
+  resources_servers:
+    mission_search:
+      entrypoint: app.py
+      domain: other
+      verified: false
+      # Optional overrides (the defaults are in MissionSearchResourcesServerConfig in app.py):
+      # top_k: 2
+      # chroma_dir: chroma_index
