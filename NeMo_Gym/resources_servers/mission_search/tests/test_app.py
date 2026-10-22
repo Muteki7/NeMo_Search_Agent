@@ -13,8 +13,14 @@ from ..app import (
     VERIFIER_FIXTURE,
     CorpusSearcher,
     MissionSearchResourcesServerConfig,
+    MissionSearchVerifier,
+    MissionSearchVerifyRequest,
+    combine,
+    coverage,
     final_message_text,
     normalize,
+    ramp,
+    retrieval_score,
     score_answer,
 )
 
@@ -84,6 +90,94 @@ def test_final_message_is_the_last_message_item() -> None:
     assert final_message_text([message("first"), call, message("last")]) == "last"
     assert final_message_text([call]) is None
     assert final_message_text([]) is None
+
+
+# ---- retrieval reward (run 2) -----------------------------------------------------------------------------------
+def _output(*items):
+    """A response output: ("call",), ("result", text) or ("msg", text) in order."""
+    kinds = {"call": lambda a=None: SimpleNamespace(type="function_call"),
+             "result": lambda text: SimpleNamespace(type="function_call_output", output=text),
+             "msg": lambda text: SimpleNamespace(type="message", content=[SimpleNamespace(type="output_text", text=text)])}
+    return [kinds[k](*args) for k, *args in items]
+
+
+REFERENCE = "The trajectory prior to the tank incident was nearly identical to that of Apollo 12."  # content words: 8
+
+
+def test_coverage_and_ramp() -> None:
+    assert coverage("the free return profile of the spacecraft", "To return the spacecraft to a free-return profile.") == 1.0
+    assert coverage("Apollo 12 tank trajectory", REFERENCE) == 0.5                          # 4 of 8 content words
+    assert coverage("nothing in common here", REFERENCE) == 0.0
+    assert coverage("anything", "of the to") == 0.0                                          # a reference of only small words
+    assert coverage("at 18:24 ok", "18:24") == 1.0                                           # 18 and 24 are separate words on both sides
+    assert (ramp(0.0), ramp(0.3), ramp(0.6), ramp(1.0)) == (0.0, 0.0, 1.0, 1.0)
+    assert abs(ramp(0.45) - 0.5) < 1e-9 and abs(ramp(0.5) - 2 / 3) < 1e-9
+
+
+def test_retrieval_discount_and_no_farming() -> None:
+    hit, miss = "free return profile spacecraft", "nothing useful"
+    answer = "To return the spacecraft to a free-return profile."
+    one = retrieval_score(_output(("call",), ("result", hit)), answer)
+    assert one == (1.0, 1.0, 1)
+    assert retrieval_score(_output(("call",), ("result", miss), ("call",), ("result", hit)), answer)[0] == 0.5   # a retry is worth half
+    assert retrieval_score(_output(("call",), ("result", hit), ("call",), ("result", hit)), answer)[0] == 1.0   # more searches add nothing
+    assert retrieval_score(_output(("call",), ("result", miss)) * 5, answer)[0] == 0.0                          # spam of misses
+    assert retrieval_score(_output(("msg", "no search at all")), answer) == (0.0, 0.0, 0)
+
+
+def test_combined_reward_orders_the_outcomes() -> None:
+    correct_found = combine(1.0, 1.0, True)
+    correct_from_memory = combine(1.0, 0.0, True)
+    found_not_used = combine(0.0, 1.0, True)
+    nothing = combine(0.0, 0.0, True)
+    assert (correct_found, correct_from_memory, found_not_used, nothing) == (1.0, 0.75, 0.25, 0.0)
+    assert correct_found > correct_from_memory > found_not_used > nothing
+    assert combine(0.0, 1.0, False) == 0.0 and combine(0.3, 1.0, False) == 0.75 * 0.3        # the gate removes only the retrieval part
+
+
+def _request(output, answer):
+    return MissionSearchVerifyRequest.model_validate({
+        "responses_create_params": {"input": "q"}, "answer": answer,
+        "response": {"id": "r", "created_at": 0, "model": "m", "object": "response", "parallel_tool_calls": False,
+                     "tool_choice": "auto", "tools": [], "output": output}})
+
+
+def _json_output(*items):
+    msg = lambda t: {"id": "m", "type": "message", "role": "assistant", "status": "completed",
+                     "content": [{"type": "output_text", "text": t, "annotations": []}]}
+    call = {"id": "f", "type": "function_call", "call_id": "c", "name": "search_corpus", "arguments": "{}", "status": "completed"}
+    return [call if k == "call" else {"type": "function_call_output", "call_id": "c", "output": a[0]} if k == "result" else msg(a[0])
+            for k, *a in items]
+
+
+def test_verify_returns_the_parts_and_the_gate() -> None:
+    hit = "Result 1:\nfree return profile spacecraft\n------\n"
+    verifier = MissionSearchVerifier()
+    answer = "To return the spacecraft to a free-return profile."
+    full = asyncio.run(verifier.verify(_request(_json_output(("call",), ("result", hit), ("msg", answer)), answer)))
+    assert full.reward == 1.0 and full.reward_answer == 1.0 and full.reward_retrieval == 1.0 and full.retrieval_gate == 1.0
+    assert full.reward_components == {"answer": 1.0, "retrieval": 1.0} and full.n_searches == 1.0 and full.best_cov == 1.0
+    spam = asyncio.run(verifier.verify(_request(_json_output(*[("call",), ("result", hit)] * 5), answer)))
+    assert spam.reward == 0.0 and spam.reward_retrieval == 1.0 and spam.retrieval_gate == 0.0          # hits, but no final message
+    unused = asyncio.run(verifier.verify(_request(_json_output(("call",), ("result", hit), ("msg", "I do not know.")), answer)))
+    assert unused.reward == 0.25 and unused.reward_answer == 0.0                                         # found it, did not use it
+
+
+def test_the_endpoint_keeps_the_extra_fields() -> None:
+    """FastAPI drops fields that the response model does not list. Go through the same wrappers as the real server."""
+    pytest.importorskip("httpx")
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from nemo_gym.judge import judge_failsafe
+    from nemo_gym.telemetry.endpoints import traced_verify_endpoint
+
+    app = FastAPI()
+    app.post("/verify")(traced_verify_endpoint(judge_failsafe(MissionSearchVerifier().verify)))
+    body = _request(_json_output(("call",), ("result", "free return profile spacecraft"), ("msg", "free return profile")),
+                    "To return the spacecraft to a free-return profile.").model_dump(mode="json")
+    reply = TestClient(app).post("/verify", json=body).json()
+    assert {"reward", "reward_answer", "reward_retrieval", "retrieval_gate", "best_cov", "n_searches"} <= set(reply), set(reply)
 
 
 # ---- search tool (needs the Chroma index from scripts/build_index.py) --------------------------------------------

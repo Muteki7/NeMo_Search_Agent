@@ -10,7 +10,8 @@ while training. It loads the model once, then evaluates the base model (no adapt
 - The reward comes from the real /verify, so base and checkpoints must be evaluated with the same server (same app.py).
 - Output in --run-dir: eval_base.jsonl, eval_<checkpoint name>.jsonl (one line for each question, same fields as
   train_dump.jsonl) and eval_summary.json. A table is printed at the end.
-Metrics: mean reward (with its standard error), share of rewards at 1.0, "contains" (the expected answer is in the final
+Metrics: mean ANSWER-ONLY reward (with its standard error; from run 2 on, /verify also returns a combined reward with a retrieval part,
+which is stored as reward_total and not used as the headline), share of rewards at 1.0, "contains" (the expected answer is in the final
 answer, whatever its length: it does not depend on the length cap), tool-call rate, answer rate, mean turns, mean words
 in the final answer, and the paired change in reward against the base model.
 """
@@ -23,8 +24,8 @@ from pathlib import Path
 
 from train_grpo import MAX_COMPLETION, MAX_NEW, MAX_TURNS, MODEL, load_dataset, load_model
 
-from rollout import (GymClient, answer_words, append_jsonl, contains_answer, final_text, make_gym_verify_reward,
-                     make_vllm_generate_fn, run_rollout, startup_checks, trajectory_record, vram_used_mib)
+from rollout import (REWARD_PARTS, GymClient, answer_words, append_jsonl, contains_answer, final_text, make_vllm_generate_fn,
+                     run_rollout, startup_checks, trajectory_record, verify_batch, vram_used_mib)
 
 
 def evaluate(label, model, tok, client, rows, lora_request, dump_path, chunk=32):
@@ -32,20 +33,22 @@ def evaluate(label, model, tok, client, rows, lora_request, dump_path, chunk=32)
     from vllm import SamplingParams
     generate_fn = make_vllm_generate_fn(model.vllm_engine, SamplingParams(temperature=0.0, max_tokens=MAX_NEW, logprobs=0),
                                         lora_request)
-    reward_fn = make_gym_verify_reward(client)
     open(dump_path, "w").close()
     records, t0 = [], time.time()
     for start in range(0, len(rows), chunk):   # vLLM runs about 32 sequences at once: send the rows in chunks
         batch = rows[start:start + chunk]
         out = run_rollout([r["prompt"] for r in batch], tok, generate_fn, client.call_tool, max_turns=MAX_TURNS,
                           max_completion_tokens=MAX_COMPLETION, max_new_tokens=MAX_NEW)
-        rewards = reward_fn(prompts=[r["prompt"] for r in batch], completions=[None] * len(batch),
-                            trajectory=out["trajectory"], answer=[r["answer"] for r in batch],
-                            responses_create_params=[r["responses_create_params"] for r in batch])
-        new = [trajectory_record(r["prompt"], r["answer"], t, rew, model=label, index=start + i,
+        replies = verify_batch(client, [r["prompt"] for r in batch], out["trajectory"], [r["answer"] for r in batch],
+                               [r["responses_create_params"] for r in batch])
+        # The headline reward is the ANSWER-ONLY reward, the same quantity that run 1 trained on and was judged by.
+        # (reward_answer is missing only if the server runs an old verifier: then `reward` is the answer reward.)
+        new = [trajectory_record(r["prompt"], r["answer"], t, rep.get("reward_answer", rep["reward"]), model=label,
+                                 index=start + i, reward_total=rep["reward"],
                                  contains=contains_answer(final_text(t), r["answer"]),
-                                 final_words=len(answer_words(final_text(t))))
-               for i, (r, t, rew) in enumerate(zip(batch, out["trajectory"], rewards))]
+                                 final_words=len(answer_words(final_text(t))),
+                                 **{k: rep[k] for k in REWARD_PARTS if k in rep})
+               for i, (r, t, rep) in enumerate(zip(batch, out["trajectory"], replies))]
         append_jsonl(dump_path, new)
         records += new
         print(f"[eval] {label}: {len(records)}/{len(rows)} done, {time.time() - t0:.0f} s, VRAM {vram_used_mib()} MiB")
@@ -75,6 +78,10 @@ def summarize(label, records, base_records=None):
         "answer_rate": sum(r["ended"] == "answer" for r in records) / n,
         "mean_turns": sum(r["n_turns"] for r in records) / n,
         "mean_final_words": sum(r["final_words"] for r in records) / n,
+        # Retrieval diagnostics (from the lexical coverage in the verifier; absent in dumps of an old verifier)
+        "retrieved": (sum(r["best_cov"] >= 0.6 for r in records) / n) if "best_cov" in records[0] else None,
+        "retrieval_score": (sum(r["reward_retrieval"] for r in records) / n) if "reward_retrieval" in records[0] else None,
+        "reward_total": (sum(r["reward_total"] for r in records) / n) if "reward_total" in records[0] else None,
         "endings": {k: sum(r["ended"] == k for r in records) / n
                     for k in ("answer", "truncated", "bad_call", "turn_cap", "budget")},
     }
@@ -87,11 +94,13 @@ def summarize(label, records, base_records=None):
 
 def print_table(summaries):
     print("\n[eval] summary (greedy decoding; se = standard error; the change is paired on the same questions)")
-    print(f"  {'model':<16} {'n':>4} {'reward':>14} {'exact':>6} {'contains':>8} {'tools':>6} {'answered':>8} {'turns':>6} {'words':>6} {'change vs base':>16}")
+    print("[eval] `reward` is the ANSWER-ONLY reward (comparable across runs). `retrieved` = share of questions where a search result held >= 60% of the reference's content words.")
+    print(f"  {'model':<16} {'n':>4} {'reward':>14} {'exact':>6} {'contains':>8} {'tools':>6} {'answered':>8} {'retrieved':>9} {'turns':>6} {'words':>6} {'change vs base':>16}")
     for s in summaries:
         change = f"{s['delta_reward_vs_base']:+.3f} ± {s['delta_reward_se']:.3f}" if "delta_reward_vs_base" in s else "-"
         print(f"  {s['model']:<16} {s['n']:>4} {s['reward']:>7.3f} ± {s['reward_se']:.3f} {s['exact']:>6.2f} {s['contains']:>8.2f} "
-              f"{s['tool_call_rate']:>6.2f} {s['answer_rate']:>8.2f} {s['mean_turns']:>6.2f} {s['mean_final_words']:>6.1f} {change:>16}")
+              f"{s['tool_call_rate']:>6.2f} {s['answer_rate']:>8.2f} {('%.2f' % s['retrieved']) if s.get('retrieved') is not None else '-':>9} "
+              f"{s['mean_turns']:>6.2f} {s['mean_final_words']:>6.1f} {change:>16}")
 
 
 def main():

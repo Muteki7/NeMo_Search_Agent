@@ -19,9 +19,9 @@ from fastapi import FastAPI
 from pydantic import BaseModel, ConfigDict, PrivateAttr
 
 from nemo_gym.base_resources_server import (
+    BaseMultiRewardVerifyResponse,
     BaseResourcesServerConfig,
     BaseVerifyRequest,
-    BaseVerifyResponse,
     ReverifyMode,
     SimpleResourcesServer,
 )
@@ -165,15 +165,82 @@ def final_message_text(output: list) -> Optional[str]:
     return None
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# Retrieval reward (run 2): credit for a search whose results contain the reference answer's facts
+# ---------------------------------------------------------------------------------------------------------------
+# reward = (1 - RETRIEVAL_WEIGHT) * R_answer + RETRIEVAL_WEIGHT * gate * ret
+#   cov_k = share of the reference answer's content words found in the k-th search result (bag of words)
+#   s_k   = ramp(cov_k): 0 below RAMP_LOW, rising linearly to 1 at RAMP_HIGH
+#   ret   = max over searches k = 1, 2, ... of RETRIEVAL_DISCOUNT^(k-1) * s_k
+#           (a later search is worth half as much, so extra searches cannot be farmed: after a hit they add nothing)
+#   gate  = 1 if the trajectory ends with a final message, else 0 (spam to the turn cap, or searching and never answering, scores 0)
+# A correct answer with a retrieval hit scores 1.0, a correct answer without one 0.75, a hit with no usable answer at most 0.25.
+# Freeze these numbers for a run, like the length cap above.
+RETRIEVAL_WEIGHT = 0.25
+RETRIEVAL_DISCOUNT = 0.5
+RAMP_LOW = 0.3
+RAMP_HIGH = 0.6
+
+
+def word_set(text: str) -> set:
+    """Lowercase letters and digits, split on everything else (so `18:24` gives {18, 24})."""
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def coverage(result_text: str, expected: str) -> float:
+    """cov_k: the share of the reference answer's content words (stop words removed) that appear in `result_text`."""
+    needed = word_set(expected) - STOP_WORDS
+    return len(needed & word_set(result_text)) / len(needed) if needed else 0.0
+
+
+def ramp(cov: float) -> float:
+    return min(1.0, max(0.0, (cov - RAMP_LOW) / (RAMP_HIGH - RAMP_LOW)))
+
+
+def search_results(output: list) -> list:
+    """The text of each tool result, in the order of the searches."""
+    return [item.output for item in output if getattr(item, "type", None) == "function_call_output" and isinstance(item.output, str)]
+
+
+def retrieval_score(output: list, expected: str) -> tuple:
+    """(ret, best_cov, number of searches). ret is 0.0 when there was no search."""
+    covs = [coverage(text, expected) for text in search_results(output)]
+    ret = max((RETRIEVAL_DISCOUNT**k * ramp(c) for k, c in enumerate(covs)), default=0.0)
+    return ret, max(covs, default=0.0), len(covs)
+
+
+def combine(answer_reward: float, ret: float, answered: bool) -> float:
+    return (1.0 - RETRIEVAL_WEIGHT) * answer_reward + RETRIEVAL_WEIGHT * (ret if answered else 0.0)
+
+
 class MissionSearchVerifyRequest(BaseVerifyRequest):
     model_config = ConfigDict(extra="allow")  # data rows also carry difficulty, chunk_id, block
     answer: str
 
 
+class MissionSearchVerifyResponse(BaseMultiRewardVerifyResponse):
+    # `reward` is the combined value that the trainer uses. The parts are also top-level fields, so a caller can read the
+    # answer-only reward (the yardstick for comparing runs) and the retrieval numbers.
+    reward_answer: float = 0.0       # R_answer: the answer reward alone (what run 1 trained on)
+    reward_retrieval: float = 0.0    # ret, before the gate
+    retrieval_gate: float = 0.0      # 1.0 if the trajectory ended with a final message
+    best_cov: float = 0.0            # the best cov_k over the searches, without the discount
+    n_searches: float = 0.0
+
+
 class MissionSearchVerifier:
-    async def verify(self, body: MissionSearchVerifyRequest) -> BaseVerifyResponse:
-        reward = score_answer(final_message_text(body.response.output), body.answer)
-        return BaseVerifyResponse(**body.model_dump(), reward=reward)
+    async def verify(self, body: MissionSearchVerifyRequest) -> MissionSearchVerifyResponse:
+        final_text = final_message_text(body.response.output)
+        answer_reward = score_answer(final_text, body.answer)
+        ret, best_cov, n_searches = retrieval_score(body.response.output, body.answer)
+        answered = final_text is not None
+        return MissionSearchVerifyResponse(
+            **body.model_dump(),
+            reward=combine(answer_reward, ret, answered),
+            reward_components={"answer": answer_reward, "retrieval": ret if answered else 0.0},
+            reward_answer=answer_reward, reward_retrieval=ret, retrieval_gate=float(answered),
+            best_cov=best_cov, n_searches=float(n_searches),
+        )
 
 
 # ---------------------------------------------------------------------------------------------------------------

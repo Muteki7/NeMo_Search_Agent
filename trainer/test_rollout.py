@@ -16,7 +16,7 @@ from functools import lru_cache
 import rollout
 from rollout import (GenOut, GymClient, GymError, build_response, checkpoint_step, contains_answer, make_gym_verify_reward,
                      make_vllm_generate_fn, normalize_text, parse_turn, prune_dump_after_step, run_rollout, startup_checks,
-                     tool_delta_ids)
+                     tool_delta_ids, verify_batch)
 from prompting import apply_chat_template
 
 MODEL = "unsloth/Llama-3.2-1B-Instruct"   # only its tokenizer and chat template are used
@@ -332,6 +332,27 @@ def test_checkpoint_step_reads_trainer_state():
     real = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs", "20261014-124347_test", "checkpoint-2")
     if os.path.isdir(real):                                         # the checkpoint from the 4-step test run
         assert checkpoint_step(real) == 2
+
+
+# ---- 5d. the parts of the reward (run 2) ----------------------------------------------------------------------
+def test_reward_parts_reach_the_dump_and_the_trainer_gets_the_combined_reward():
+    import os, tempfile
+
+    class FakeClient:
+        def post(self, path, body):
+            return {"reward": 0.625, "reward_answer": 0.5, "reward_retrieval": 0.75, "retrieval_gate": 1.0,
+                    "best_cov": 0.9, "n_searches": 1.0, "reward_components": {"answer": 0.5, "retrieval": 0.75}}
+
+    path = os.path.join(tempfile.mkdtemp(), "dump.jsonl")
+    out, _, _ = rollout_for({"Q": [("It is 1.", "stop")]})
+    rewards = make_gym_verify_reward(FakeClient(), dump_path=path)(
+        prompts=[messages("Q")], completions=[None], trajectory=out["trajectory"], answer=["1"])
+    assert rewards == [0.625]                                               # TRL trains on the combined value
+    line = json.loads(open(path, encoding="utf-8").readline())
+    assert line["reward"] == 0.625 and line["reward_answer"] == 0.5 and line["reward_retrieval"] == 0.75
+    assert line["best_cov"] == 0.9 and line["n_searches"] == 1.0 and "reward_components" not in line
+    replies = verify_batch(FakeClient(), [messages("Q")], out["trajectory"], ["1"])
+    assert replies[0]["reward_answer"] == 0.5                               # eval reads the answer-only part from here
 
 
 # ---- 6. live tests: need `ng_run` with resources_only.yaml -----------------------------------------------------

@@ -442,26 +442,36 @@ def build_response(output_items: list) -> dict:
             "parallel_tool_calls": False, "tool_choice": "auto", "tools": []}
 
 
+# The parts of the reward that /verify returns next to `reward` (the combined value the trainer uses).
+REWARD_PARTS = ("reward_answer", "reward_retrieval", "retrieval_gate", "best_cov", "n_searches")
+
+
+def verify_batch(client: GymClient, prompts, trajectory, answer, responses_create_params=None, max_workers: int = 16) -> list:
+    """POST every trajectory to /verify and return the full replies (a dict for each: reward, reward_answer, ...)."""
+    def one(i):
+        params = responses_create_params[i] if responses_create_params else {"input": prompts[i]}
+        body = {"responses_create_params": params, "response": build_response(trajectory[i]["output"]), "answer": answer[i]}
+        return client.post("/verify", body)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        return list(pool.map(one, range(len(prompts))))
+
+
 def make_gym_verify_reward(client: GymClient, max_workers: int = 16, dump_path=None, step_offset: int = 0):
-    """`dump_path`: if set, every trajectory is appended there with its reward (see `trajectory_record`).
+    """`dump_path`: if set, every trajectory is appended there with its reward and the parts of it (see `trajectory_record`).
     TRL calls the reward once for each rollout, so `step` counts the optimizer steps of this run."""
     calls = {"n": step_offset}   # after a resume, the steps continue from the checkpoint step
 
     def gym_verify_reward(prompts, completions, trajectory, answer, responses_create_params=None, **kwargs):
         """One reward for each trajectory. TRL passes the dataset columns `answer` and `responses_create_params`
         and the `trajectory` field that rollout_func returned."""
-        def one(i):
-            params = responses_create_params[i] if responses_create_params else {"input": prompts[i]}
-            body = {"responses_create_params": params, "response": build_response(trajectory[i]["output"]),
-                    "answer": answer[i]}
-            return float(client.post("/verify", body)["reward"])
-
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            rewards = list(pool.map(one, range(len(prompts))))
+        replies = verify_batch(client, prompts, trajectory, answer, responses_create_params, max_workers)
+        rewards = [float(r["reward"]) for r in replies]
         if dump_path:
             calls["n"] += 1
-            append_jsonl(dump_path, [trajectory_record(prompts[i], answer[i], trajectory[i], rewards[i],
-                                                       step=calls["n"], index=i) for i in range(len(prompts))])
+            append_jsonl(dump_path, [trajectory_record(prompts[i], answer[i], trajectory[i], rewards[i], step=calls["n"], index=i,
+                                                       **{k: replies[i][k] for k in REWARD_PARTS if k in replies[i]})
+                                     for i in range(len(prompts))])
         return rewards
 
     return gym_verify_reward

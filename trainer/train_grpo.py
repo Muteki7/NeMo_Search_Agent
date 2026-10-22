@@ -54,10 +54,12 @@ TOP_P = 0.95
 
 # From AutoDidact (autodidact.ipynb). Dropped: use_agentic_generate (our rollout_func replaces it) and
 # max_prompt_length (removed in TRL 0.29). beta = 0: no KL term, so no reference model.
+# Run 2 differs from run 1 in two ways: scale_rewards="none" (below) and the retrieval reward in the verifier (app.py).
 HYPERPARAMETERS = dict(
     learning_rate=5e-6, adam_beta1=0.9, adam_beta2=0.99, weight_decay=0.1,
     warmup_steps=0.1,   # transformers 5 has no warmup_ratio: a warmup_steps below 1 is a ratio (AutoDidact: warmup_ratio=0.1)
     lr_scheduler_type="cosine", optim="paged_adamw_8bit", max_grad_norm=0.1, beta=0.0,
+    scale_rewards="none",   # run 2: no division by the group std (Dr. GRPO). Run 1 used the TRL default, "group".
 )
 
 

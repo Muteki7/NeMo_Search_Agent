@@ -25,6 +25,9 @@ def main():
     rows = [json.loads(line) for line in args.dump.read_text(encoding="utf-8").splitlines() if line]
     for r in rows:
         r["new_reward"] = score_answer(r["final_text"], r["answer"])
+        # score_answer is the ANSWER-ONLY reward. A dump of run 2 or later also holds the combined reward in `reward`
+        # and the answer part in `reward_answer`: compare with the answer part.
+        r["reward"] = r.get("reward_answer", r["reward"])
 
     print(f"{len(rows)} trajectories from {args.dump}")
     print(f"mean reward: recorded {sum(r['reward'] for r in rows) / len(rows):.3f} -> now {sum(r['new_reward'] for r in rows) / len(rows):.3f}")
