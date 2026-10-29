@@ -14,34 +14,40 @@ Research findings that shape the design:
 **Decisions (confirmed with you):**
 1. A generic multi-turn loop runs in `rollout_func` on Unsloth's collocated vLLM. It follows the Token-In, Token-Out (TITO) rule from the HF post: sampled token ids go into a running buffer and are never re-encoded (details in step 5).
 2. A NeMo Gym resources server owns the environment: the `search_corpus` tool plus `verify()`, both over HTTP.
-3. `verify()` uses a deterministic answer match.
+3. `verify()` is a deterministic function of the response (STATELESS). Run 1 used the answer match alone. From run 2 it adds a retrieval part (step 4, step 6). A semantic match with BGE-M3 is planned (step 8).
 4. Fresh `search_gym/` directory with clean venvs.
-5. Reuse the existing `questions.json`/`chunks.pkl`. No question regeneration.
+5. Reuse the existing `questions.json`/`chunks.pkl`. No question regeneration so far. A quality audit of the questions and references is planned (step 8), and it decides if we regenerate.
 
 **Why this scales:** the rollout loop is environment-agnostic. It only knows "generate from token ids → decode only to parse the JSON tool call → POST `/{tool_name}` → append the tool message's token delta → repeat" and "POST `/verify`". Adding a new environment later means adding a new resources server plus data rows carrying a server ref. The trainer does not change.
 
 ## Layout
 
 ```
-reasoning_model/search_gym/
-├── Gym/                                   # git clone NVIDIA-NeMo/Gym (own uv venv, Python 3.13.14 pinned)
-│   └── resources_servers/mission_search/  # our environment (NeMo Gym scaffold layout)
-│       ├── app.py            # tool endpoint + verify
-│       ├── embeddings.py     # copied from AutoDidact/embeddings.py (CPU, batched); used by build_index.py and the search tool
+NeMo_search_agent/                         # the repository
+├── Plan.md, Learnings.md, Dependency_hell.md, Debug_checks.md, rules.md, ASD-STE100.jpeg
+├── Step2_Files/                           # AutoDidact files (questions.json, chunks.pkl, ...); git-ignored
+├── Embedder/bge-m3/                       # BGE-M3 weights (2.2 GB), loaded from this path; git-ignored
+├── NeMo_Gym/
+│   ├── Gym/                               # clone of NVIDIA-NeMo/Gym (own .git, own uv venv); git-ignored
+│   └── resources_servers/mission_search/  # our environment (NeMo Gym scaffold layout); tracked in git
+│       ├── app.py            # tool endpoint + verify (answer reward + retrieval reward)
+│       ├── embeddings.py     # NoInstruct embedder (CPU, batched); used by build_index.py and the search tool
 │       ├── configs/mission_search.yaml, configs/resources_only.yaml
-│       ├── data/{example,train,validation}.jsonl
-│       ├── chroma_index/     # built by scripts/build_index.py: 510 merged chunks (git-ignored)
-│       ├── .venv/            # server venv, built from requirements.txt the way Gym builds it (git-ignored)
-│       ├── scripts/build_index.py, scripts/convert_questions.py
-│       ├── tests/{test_app.py, verifier_cases.jsonl}
-│       └── requirements.txt  # -e nemo-gym[dev] @ ../../Gym; CPU-only torch pinned by URL; pinned transformers, chromadb, langchain-chroma, langchain-core
-└── trainer/                               # training venv: currently trainer/temp/.venv-temp (Python 3.12), see Dependency_hell.md
-    ├── rollout.py      # generic multi-turn rollout_func + gym client (TITO token buffer, see step 5)
-    ├── train_grpo.py   # Unsloth model + GRPOTrainer(rollout_func=..., reward_funcs=[gym_verify_reward])
-    ├── eval.py         # held-out eval, with and without LoRA
-    ├── prompting.py    # renders chat prompts with the template date pinned (26 Jul 2024); all render sites must use it
-    ├── spike_rollout_func.py        # Gate 1 spike (passed); its rollout is the reference for rollout.py
-    └── temp/working_stack.freeze.txt  # frozen package versions of the working venv
+│       ├── data/{example,train,validation}.jsonl   # the scaffold's data/.gitignore hides train and validation
+│       ├── chroma_index/     # 510 merged chunks, built by scripts/build_index.py (git-ignored)
+│       ├── .venv/            # server venv (git-ignored)
+│       ├── scripts/          # build_index.py, convert_questions.py, rescore_dump.py, report.py, retrieval_bench.py
+│       ├── tests/            # test_app.py, test_report.py, test_retrieval_bench.py, verifier_cases.jsonl
+│       └── requirements.txt  # CPU-only torch pinned by URL; pinned transformers, chromadb, langchain-chroma, langchain-core
+└── trainer/                               # trainer venv: trainer/temp/.venv-temp (Python 3.12), see Dependency_hell.md
+    ├── rollout.py        # Gym client, tool-call parser, TITO loop, vLLM wiring, verify reward, dump helpers
+    ├── train_grpo.py     # Unsloth model + GRPOTrainer, per-run folder, resume
+    ├── eval.py           # base model and checkpoints on the validation set (greedy)
+    ├── rollout_smoke.py  # test 2: the rollout alone on vLLM and the live server
+    ├── test_rollout.py   # test 1: 24 CPU tests with a fake model and a fake tool
+    ├── prompting.py      # renders chat prompts with the template date pinned (26 Jul 2024); all render sites must use it
+    ├── spike_rollout_func.py   # Gate 1 spike (passed)
+    └── runs/<start time>_<name>/   # run_config.json, train_dump.jsonl, checkpoint-N/, final/, eval_*.jsonl, report.html (git-ignored)
 ```
 AutoDidact stays untouched as a reference.
 
@@ -94,7 +100,7 @@ Script: `NeMo_Gym/resources_servers/mission_search/scripts/build_index.py`. Run 
 - **Limits.** Answer coverage is a token-overlap proxy (a result holds at least 60% of the answer's key words). The centre-chunk rise is partly mechanical, because a merged chunk covers more positions. The gain is small, about 2 points. The check samples every third question and stops at 400, so it never tests the last 16% of the questions.
 
 ### 4. Resources server: `app.py`: DONE
-Files: `NeMo_Gym/resources_servers/mission_search/app.py`, `configs/resources_only.yaml`, `tests/test_app.py`, `tests/verifier_cases.jsonl`. Status (2026-10-07): 14 tests pass in the server venv, the server starts with `ng_run`, and the search call and the verify calls gave the expected results.
+Files: `NeMo_Gym/resources_servers/mission_search/app.py`, `configs/resources_only.yaml`, `tests/test_app.py`, `tests/verifier_cases.jsonl`. Status (2026-10-27): the tests pass in the server venv (`test_app.py` has 22), the server starts with `ng_run`, and the search call and the verify calls gave the expected results.
 - **Config.** `MissionSearchResourcesServerConfig` has `chroma_dir` (default `chroma_index`, relative to the server folder), `collection_name` (`example_collection`), `embedding_model` and `top_k=2`. `REVERIFY_MODE` is STATELESS: `verify` never reads the index, so it is a pure function of the request body.
 - **Tool.** `POST /search_corpus` takes `{query}` and returns `{results}`. `CorpusSearcher` opens the index once at server start with the same `CustomHuggingFaceEmbeddings` class that built it. The text format is the AutoDidact format (`Result i:`, the chunk text, `------`). The route name equals the tool name in the data rows, because the agent POSTs each tool call to `/{tool name}`. The embedding runs in a thread (`asyncio.to_thread`), so parallel rollouts do not block the server.
   - Deviation: `search_module.py` is not imported. It loads its own index at import time with old paths and `results=5`. Only its output format is copied.
@@ -104,7 +110,7 @@ Files: `NeMo_Gym/resources_servers/mission_search/app.py`, `configs/resources_on
   - 0.0 when there is no final message or no text is left after the reasoning is removed.
 - **Containment cap (deviation).** "Short" means at most 5 x (expected words) + 15 words (`LENGTH_CAP_FACTOR` and `LENGTH_CAP_EXTRA` in `app.py`). Without a cap, a model could paste a whole chunk and get 1.0. It was 3 x + 10 at first. A dump of 40 trajectories from the 8B model showed two correct but wordy answers that got only 0.29 and 0.35, so it is now 5 x + 15 (the mean reward moved from 0.200 to 0.234, and no cap at all gives the same). Freeze it for a run: base and trained models must be scored with the same value.
 - **F1 on content words (deviation, 2026-10-14).** The first smoke run (1B model) gave the highest rewards to non-answers (a bad tool call got 0.19), because the F1 counted small words such as "of" and "to". The F1 now drops stop words (`STOP_WORDS` in `app.py`; `not` and `no` stay in). A text of only small words gets 0.0.
-- **No tool-call bonus (deviation).** Decide after the first rollouts show how often the base model calls the tool. Add a small bonus, capped so that the total stays at or below 1.0, only if almost no sample calls the tool.
+- **Retrieval part of the reward (deviation, run 2, 2026-10-21).** No tool-call bonus was added. Instead `verify` pays for a search whose result holds the reference's facts: `reward = 0.75 x R_answer + 0.25 x gate x ret`. `cov_k` is the share of the reference's content words found in the result of search k. `s_k` is a ramp (0 below 0.3, 1 at 0.6 and above). `ret` is the maximum over searches of `0.5^(k-1) x s_k`, so extra searches cannot be farmed. `gate` is 1 only if the trajectory ends with a final message, so spam to the turn cap scores 0. A correct answer with a hit scores 1.0, a correct answer without one 0.75, a hit with no usable answer at most 0.25. The constants (`RETRIEVAL_WEIGHT`, `RETRIEVAL_DISCOUNT`, `RAMP_LOW`, `RAMP_HIGH`) are at the top of that block in `app.py`. Freeze them for a run. `/verify` returns the combined `reward` and the parts (`reward_answer`, `reward_retrieval`, `retrieval_gate`, `best_cov`, `n_searches`, `reward_components`), in Gym's `BaseMultiRewardVerifyResponse` pattern.
 - **Where the expected answers come from.** An 8B model wrote them from three-chunk windows (`generate_data.py`). Nobody checked them. A correct answer in other words scores below 1.0. See `Learnings.md` L13.
 - **Configs.** `mission_search.yaml` keeps the resources server and the `simple_agent` entry. It cannot start alone, because `simple_agent` needs a `policy_model` that we do not have. Use it later for `gym eval run` with a model endpoint. `resources_only.yaml` has only the resources server, with no agent and no datasets. It is the file for training.
 - **Where the agent and the trainer live (deviation from the Gym layout).** There is no agent server. `rollout_func` in the trainer (step 5) is the agent: it generates on the trainer's own vLLM engine, POSTs tool calls to `/search_corpus`, and the answer to `/verify`. `simple_agent` would need a second vLLM engine and works on text, so it breaks the single-engine gate and the TITO rule. The trainer lives in `trainer/` and is not a Gym server.
@@ -114,29 +120,68 @@ Files: `NeMo_Gym/resources_servers/mission_search/app.py`, `configs/resources_on
 - **Tests.** `verifier_cases.jsonl` has six cases: two full reward, two zero reward and two malformed (no `response`, no `answer`). `test_app.py` also tests the scoring rules (partial F1, the length cap, reasoning-only answers, the last message) and the search tool (output format, `top_k`, parallel searches give the same text). The search tests skip if the index is missing.
 - **Retrieval limit seen here.** For the example question ("What time was the flotation collar inflated?") the only chunk that mentions the collar is not in the top 5. A 60-question check gave window recall 77% at top 2 and 90% at top 5. Some questions need a reworded query. That is the behaviour that training should find.
 
-### 5. Trainer: `rollout.py` + `train_grpo.py`
-- **Gym client:** discover server host/port from the head server's `GET :11000/global_config_dict_yaml`. Copy the pattern from `Example_NeMo.ipynb` cell 7.
-- **`make_rollout_func(max_turns=5)`**, a batched loop modelled on `run_agent` (`rl_helpers.py:288`):
-  - TRL passes prompts already repeated `num_generations` times: return exactly one trajectory per incoming prompt, in the same order. Do not multiply by `num_generations` again.
-  - **TITO (token-in, token-out).** Each trajectory keeps a running id buffer (`ctx_ids`), initialised from the tokenized prompt (`prompting.apply_chat_template(tok, messages, add_generation_prompt=True, tokenize=True, return_dict=False)`; every render goes through `prompting.py`, which pins the template's date so prompts are identical on any day). The buffer is the source of truth, and nothing decoded is ever re-encoded.
-  - Generate from ids: `generate([{"prompt_token_ids": ctx_ids[i]}, ...], ..., lora_request=...)`, with the call from step 1(c). Sampled ids are appended to the buffer and to `completion_ids` exactly as vLLM produced them.
-  - Decode the sampled text only to route the tool call: parse with `extract_json_objects` (`rl_helpers.py:89`, copied), accepting `{"name","parameters"|"arguments"}` or a nested `"function"` form. The decoded text is never fed back into the prompt.
-  - If there's a tool call, POST `/{name}`, then append the tool message as a template-diff delta by id: render a dummy `[user, assistant]` conversation with and without the tool message (role `ipython`), subtract the token lists, and append the difference. Assert the prefix is unchanged on every call, and run the same prefix-preservation property check at startup. Otherwise mark the trajectory done.
-  - Truncation (`finish_reason == "length"`) ends the trajectory: the buffer stays as sampled and nothing is added.
-  - `env_mask` is 1 for sampled tokens and 0 for the appended tool delta, and `logprobs` come from vLLM, with 0.0 for env tokens. Check `out.prompt_token_ids` equals what was sent, and that the last prompt sent plus its generation equals `prompt_ids + completion_ids`.
-  - **Open item (decide later): JSON quoting of tool output.** The Llama template JSON-quotes string content for the `ipython`/`tool` roles (`"…"`). For search chunks we probably don't want that. Decide how to append the retrieved chunks, and re-run the prefix-preservation check with the final format.
-  - **Open item (later): history rewriting.** If a reasoning model or a harness strips or compacts earlier turns, TITO breaks. The mitigation from the HF post is to freeze everything before the last rewrite as prompt context (mask zero) and train only on the sampled tokens after it. Llama's template does not strip anything, so this is not needed for v1.
-  - Return `prompt_ids`, `completion_ids`, `logprobs`, `env_mask`, and `trajectory`. The trajectory is Responses-API output items (`function_call`, `function_call_output`, final `message`).
-- **`gym_verify_reward(prompts, completions, trajectory, answer, responses_create_params, **kw)`:** POST `/verify` per item. The request shape follows `Example_NeMo.ipynb` cell 11, but with the real multi-turn `output`.
-- **`train_grpo.py`:**
-  - Model and LoRA exactly as `autodidact.ipynb` cell 1: Llama-3.1-8B-Instruct, 4-bit, r=64, all 7 projection modules. Lower `gpu_memory_utilization` to ~0.55.
-  - Hyperparameters from cell 5.
-  - Build the dataset from `train.jsonl`: `prompt` = `responses_create_params.input`, with `answer` and `responses_create_params` as passthrough columns.
-- **`eval.py`:** run `validation.jsonl` through the same loop, with and without the trained LoRA, and report mean reward. This replaces `run_eval` and notebook cells 9-10.
+### 5. Trainer: `rollout.py`, `train_grpo.py`, `eval.py`: DONE
+Files are in `trainer/`. Status (2026-10-27): two 200-step runs are trained, evaluated and compared (step 6).
+- **Gym client.** `GymClient.discover()` asks the head server (port 11000) for the host and port of the resources server. It decodes the JSON string that holds YAML. Network and server faults raise `GymError`. They are never turned into a silent reward of 0.
+- **The loop (`run_rollout`).** It takes a `generate_fn`, so it does not depend on vLLM, and CPU tests drive it with a fake model. TITO as planned: one token buffer per trajectory, sampled ids go in as they are, a tool result goes in as a template-diff delta (role `ipython`), and the prefix check runs at start. One trajectory per incoming prompt, in order. Tool calls of one turn run in parallel.
+- **How a trajectory ends** (`ended`): `answer` (a turn without a tool call), `truncated` (a turn reached `MAX_NEW`), `bad_call` (broken JSON, an unknown tool, a missing query or two calls), `turn_cap` (a tool call on the last turn is not run), `budget` (a tool result plus one more turn would not fit `MAX_COMPLETION`). The last two have no final message, so their reward is 0.
+- **Open item closed: JSON quoting.** The Llama template quotes the tool text. We left it as it is for v1 (about 0.9% more tokens).
+- **Model and LoRA.** `unsloth/Meta-Llama-3.1-8B-Instruct` in 4-bit, LoRA rank 64 on all 7 projection modules. `max_lora_rank` must be passed to `from_pretrained`: its default (16) makes vLLM refuse the adapter. `gpu_memory_utilization=0.55` (Unsloth uses 51.8%). The KV cache holds 47,280 tokens.
+- **Hyperparameters** (from AutoDidact, `autodidact.ipynb`): learning rate 5e-6, Adam betas 0.9 and 0.99, weight decay 0.1, cosine schedule with 10% warmup, `paged_adamw_8bit`, `max_grad_norm` 0.1, `beta` 0 (no KL term). Dropped: `use_agentic_generate` (our rollout replaces it) and `max_prompt_length` (removed in TRL 0.29). With transformers 5, `warmup_steps=0.1` replaces `warmup_ratio`.
+- **Our settings.** `num_generations` 8, one prompt for each step: batch 4 and accumulation 2 give 8 trajectories for each rollout, and the loss runs on 4 at a time. `MAX_TURNS` 5, `MAX_NEW` 512, `MAX_SEQ` 4096, `MAX_COMPLETION` 3000. The rollout samples at temperature 0.9, and `GRPOConfig.temperature` has the same value, because TRL divides its logits by it.
+- **Run folder.** `trainer/runs/<start time>_<name>/` holds `run_config.json`, `train_dump.jsonl` (every trajectory with its reward parts and its step), `checkpoint-N/` (about 1 GB each) and `final/`. `--save-steps 50` is the default.
+- **Resume.** `train_grpo.py --resume runs/<run>/checkpoint-N` continues in the same folder with the saved settings. It stops if the constants or hyperparameters in the code differ from the saved run. Dump lines of the steps after the checkpoint move to a side file. Checked on a copy of a test run: the scheduler, the step numbers and the rewards came back. The final weights differed by 1.4%, which is normal GPU noise.
+- **`eval.py`.** Greedy decoding on the validation set. It evaluates the base model (no adapter) once, then each checkpoint, on one loaded engine. The headline is the **answer-only** reward, so runs stay comparable. It also reports exact, contains, tool-call rate, answer rate, turns, final words, retrieval and the paired change against the base. It reuses `eval_base.jsonl` from the run folder with `--no-base`.
+- **Speed and memory.** Steps take 12 to 60 s (the mean of the last 40 steps is 12 s). 200 steps take about 62 min. Peak VRAM is 19.9 GB of 24.4 GB.
+- **Tests.** Test 1 (`test_rollout.py`): 24 CPU tests, each able to fail (checked with deliberate bugs). Test 2 (`rollout_smoke.py`): the rollout alone on the real engine and server.
+
+### 6. Runs and results
+Eval on the 148 validation questions, greedy, **answer-only reward** (± standard error). Run 1: `runs/20261015-141100_first200`, answer reward only, TRL scaling by the group std. Run 2: `runs/20261021-141800_run2_retrieval`, `scale_rewards="none"` and the retrieval part in the reward.
+
+| Model | Reward | Exact | Contains | Retrieved (word overlap) | Searches |
+|---|---|---|---|---|---|
+| Base | 0.191 ± 0.029 | 0.15 | 0.19 | 0.72 | 1.95 |
+| Run 1, step 50 / 100 / 150 / 200 | 0.361 / 0.460 / 0.462 / 0.461 ± 0.036 | 0.36 at 200 | 0.37 | - | 1.03 at 200 |
+| Run 2, step 50 / 100 / 150 / 200 | 0.390 / 0.473 / 0.478 / 0.499 ± 0.037 | 0.41 at 200 | 0.43 | 0.68 at 200 | 1.03 at 200 |
+
+- **Run 1.** The paired gain over the base is +0.27 ± 0.04 (72 questions better, 9 worse). It stops at step 100. The model learned the output contract (the answer outside `<reasoning>`: 32 of 148 base answers were inside it only) and to search once. It did not retrieve better.
+- **Run 2.** Better by +0.039 ± 0.020 (paired, 1.9 standard errors; 19 questions better, 10 worse). That is suggestive, not proof: one training seed for each run, and two changes at once. The retrieval part carried only 7% of the learning signal inside groups, and retrieval did not improve.
+- **What limits the score.** Retrieved (68%) times converted (62% of the retrieved answers end in the final text) is about 0.42. See `Learnings.md` L18.
+
+### 7. Tools to read results
+- `scripts/rescore_dump.py`: scores any dump again with the current `score_answer` (no GPU).
+- `scripts/report.py`: one HTML report. A chart of 8 failure categories for each model, the definitions, and a question explorer. Categories come from rules over a lexical hit and a provenance hit (`Learnings.md` L18).
+- `scripts/retrieval_bench.py`: compares retrievers on the chunks (step 8, `Learnings.md` L19).
+
+### 8. Next steps (agreed order, not started)
+1. **Retriever (stage 1). Done 2026-10-29** (code, 78 tests, real cache of 510 chunks, same rankings as the benchmark on 1,582 questions; the server run under `ng_run` is not yet tested). Add a BGE-M3 hybrid retriever to the server (dense 0.4, sparse 0.2, ColBERT 0.4, on all 510 chunks, in memory, encodings cached on disk), selected by a config value, behind a small `search(query, k)` interface. The 510 chunks, their metadata and the questions do not change. The Chroma index stays as the fallback and as the source of the chunk text.
+2. **Eval only, no training.** Run the base model and run 2's final model with the new retriever at `top_k` 2 and 3. The verifier stays the same, so the numbers stay comparable. Re-run the base model whenever the retrieval changes.
+3. **Data quality audit (in parallel, no training).** Sample rows through a validator and read about 30 by hand. Count defects by type (reference does not answer the question, question not self-contained, reference garbled). Remove the repeated question rows (validation: 18 extra rows, 7 repeats with different references).
+4. **Semantic matching in the verifier (stage 2), after step 3.** BGE-M3 on the CPU in the server. The semantic score can only add credit and never replaces exact or containment. Calibrate the thresholds on labelled examples. Test it offline on stored dumps with `rescore_dump.py` first.
+5. **Training run 3** on the new retrieval, with token limits that fit `top_k` 3, and with a decision about the retrieval part of the reward (it carried 7% of the signal in run 2).
+6. **Version 2 of the corpus.** Two stages (dense and sparse candidates, then ColBERT rerank) and a vector engine such as Vespa or Qdrant. ColBERT vectors for all chunks stop fitting in memory at about 50,000 chunks.
 
 ## Verification
-1. From `NeMo_Gym`, run `resources_servers/mission_search/.venv/bin/python -m pytest resources_servers/mission_search/tests` (verifier fixture plus tool tests): done, 14 pass.
-2. Start `ng_run "+config_paths=[resources_servers/mission_search/configs/resources_only.yaml]" +skip_venv_if_present=true`, then `curl` both `/search_corpus` (should return 2 chunks) and `/verify` with a hand-built correct and incorrect response (expect 1.0 and ~0.0): done.
-3. Step-1 spike: done, all checks pass (see step 1). Re-run it after any change to the rollout loop.
-4. Smoke-train `train_grpo.py` with `max_steps=5`: rewards are non-zero, no OOM, and logged completions show `search_corpus` calls with `ipython` results.
-5. Full run (101 steps, as before), then `eval.py` comparing base vs. LoRA mean reward on the validation split.
+1. From `NeMo_Gym`, run `(ulimit -v 25165824; resources_servers/mission_search/.venv/bin/python -m pytest resources_servers/mission_search/tests)`: done 2026-10-29, 78 pass (verifier, report, retrieval benchmark, retriever), 2.7 GB resident, 16.3 GB virtual (cap 24 GB; see the header of `tests/test_retriever.py`). From `trainer`, run `temp/.venv-temp/bin/python test_rollout.py`: done, 24 pass.
+2. Start `ng_run` (procedure 4.4), then `curl` `/search_corpus` and `/verify`: done.
+3. Step-1 spike: done. Re-run it after any change to the rollout loop.
+4. Smoke-train with `--max-steps 4 --save-steps 2`, then resume from `checkpoint-2` and evaluate the checkpoints: done.
+5. Full runs of 200 steps, then `eval.py` on base and checkpoints: done twice (step 6).
+6. After a change to the retriever or the verifier: re-run the base model first, because the yardstick changed.
+
+## Surprises
+Every "yes" from a RESULT / SURPRISE line goes here (rule in `AGENTS.md`). The date is at the start of the Prediction cell.
+
+| Prediction | Check | Result | Surprise? | What we do |
+|---|---|---|---|---|
+| 2026-10-28: loading the cached BGE-M3 encodings (251 MB file, 510 chunks) takes a few seconds and a few hundred MB. | First start of the BGE-M3 retriever on the real cache. | The python process grew to 31 GB and was killed; WSL crashed 3 times. Cause: the `.npz` arrays were read again on every access, and the loop kept 510 full copies. The 5-chunk test never showed it, because the cost grows with the square of the chunk count. | yes | Loader replaced by a memory-mapped `.npy` cache with a manifest and a size guard. New test loads real-size arrays in a child process with a hard memory limit. Run every memory-heavy test under a cap. |
+| 2026-10-29: the 15 no-model retriever tests peak under 300 MB (the pytest parent process). | `/usr/bin/time -v` around the run, 4 GB cap. | 15 pass in 3.4 s, peak 523 MB. The test that imports `app.py` takes 2.2 s (it loads the NeMo Gym and pydantic code). | yes | No plan change. Expect about 600 MB for this group; the 4 GB cap stays far above it. |
+| 2026-10-29: the 3 model tests peak at 2.5 to 4.5 GB (RSS) and take 1 to 2 minutes. | `/usr/bin/time -v` around the run, 16 GB cap. | 2 pass, 1 skipped (needs `data/chunks.jsonl` and a real cache). 23 s. Peak 5.15 GB. Probable cause (not measured): each `BGEM3Retriever` in a test loads its own copy of the 2.3 GB model (the 3 model tests make 6 loads in all: 3 + 2 + 1; how many are alive at once is not measured), and loading `pytorch_model.bin` needs extra memory for a short time. | yes | No plan change. The server loads one model, so expect a lower peak there (to measure in the real cache build). Cap for these tests: set from the measured virtual peak (next row), not from RSS. |
+| 2026-10-29: the virtual peak (`VmPeak`) of the 3 model tests is 8 to 13 GB, so a cap of about 2× the measured peak is workable. | Same tests, 16 GB cap, `VmPeak` and `VmHWM` read from `/proc` at the end. | Same result (2 pass, 1 skip). `VmHWM` 5.16 GB, `VmPeak` 14.48 GB (2.8× the resident peak). The 16 GB cap had only 10% room. A cap of 2× RSS (10 GB) would fail the tests; 2× `VmPeak` (29 GB) is about the whole machine (31 GB) and protects nothing. | yes | The "2× the measured peak" rule does not work for `ulimit -v`. User chose a cap of 20 GB virtual for the model tests (about 1.4× `VmPeak`) on 2026-10-29. Written in the header of `tests/test_retriever.py`. |
+| 2026-10-29: each of 18 deliberate breaks of the retriever code is caught by a test (one sparse break might survive). | Scratch harness: one break in a copy, run the 15 no-model tests under a 4 GB cap. | 15 caught, 3 survived: largest sparse token dropped (real gap), negative sparse token not refused (not covered), chunk-store meta line not required (the test only checked the error type; another check raised the same type). | yes | Added `test_sparse_lookup_finds_the_largest_token_id_and_ignores_negative_ids` and made the chunk-store test check the reason of each error. All 3 breaks now caught; 16 no-model tests pass. |
+| 2026-10-29: the 3 breaks of the model-test group give clear CAUGHT results. | Same harness, 20 GB cap. | First run: all skipped (the copied test could not find the model folder). Second run: the ranking test failed in every break (the copy had no `data/validation.jsonl`), so those failures meant nothing. Third run, after fixing the harness: 3 of 3 CAUGHT for the right reasons. | yes | Harness fault only, no code fault. A break counts only if the unbroken copy passes first and the failing test is the one named. |
+| 2026-10-29: `data/chunks.jsonl` is 0.4 to 0.6 MB (510 chunks). | `export_chunks.py` under a 4 GB cap. | 510 chunks, 293 KB, 101 to 1,089 characters, 0.5 s, 112 MB. | yes | No plan change (chunks are shorter than the 1,500 limit, about 575 characters on average). User chose to track the file in git (not committed by me). |
+| 2026-10-29: a search with the new retriever takes about 50 ms (30 to 150 ms) on the real 510-chunk cache. | Scratch script: 1,582 searches (1,434 + 148 questions), 6 CPU threads, 20 GB cap. Ranking compared with the stored benchmark numbers. | Ranking identical to the benchmark on all 8 metrics (for example validation prov@3 0.9054, cov@3 0.8716). Start from cache 2.7 s; first build 84 s. Search: median 144 ms, 95th percentile 158 ms. Peak: 2.5 GB resident, 6.4 GB virtual. | yes | No plan change. The latency split (query encoding or scoring) is not measured. About 0.15 s per search is small next to generation time; measure it only if the training step time shows it. |
+| 2026-10-29: the whole `tests/` folder in one process, 20 GB cap, gives 58 passed. | `pytest tests` with `/usr/bin/time -v`. | 76 tests ran: 74 passed, 2 failed. (1) `real_scale`: the child's peak read 2,172 MB because `ru_maxrss` is inherited from the parent at fork (the parent had loaded the model in an earlier test file). Reproduced with 2 tests (2,097 MB). (2) a model test: `unable to mmap` because several loaded models in one process need more than 20 GB of virtual space. | yes | (1) Test fixed: the child reads its own `VmHWM`; the 510-copy break and the no-mmap break are still caught. (2) Not a code fault: the full suite needs one process for each file or group (decision asked from the user). |
+| 2026-10-29: `test_app.py`, `test_report.py`, `test_retrieval_bench.py` together peak at about 7 GB virtual (one model copy). | Same 3 files in one process, 20 GB cap, `VmPeak` and `VmHWM` read at the end. | 57 pass. `VmPeak` 15.98 GB, `VmHWM` 2.22 GB (7× the resident peak). | yes | Virtual size does not follow real memory use, so a `ulimit -v` number is a rough guard only. Decision on how to cap the full suite asked from the user. |
+| 2026-10-29: after the retriever accepts a loaded model and the tests share one (`tests/conftest.py`), the full suite gives 77 passed. | `pytest tests` in one process, 25 GB cap, `VmPeak` and `VmHWM` read at the end. | 76 passed, 1 failed: my new fake-model test. The fake hashed words into 8 slots and "battery" collided with "in", "the", "ocean". Fixed with a fixed word list. After the fix and one more test (the searcher passes its model on): 78 pass. Resident peak 2.68 GB (was 4.5 GB), virtual peak 16.31 GB. | yes | The 6 model loads in the retriever tests explained the resident peak, but not the virtual size: it is still about 16 GB with one model (probably the imported libraries). Cap for the full suite asked from the user. |

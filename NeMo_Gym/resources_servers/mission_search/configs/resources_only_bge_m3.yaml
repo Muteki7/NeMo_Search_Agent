@@ -1,0 +1,13 @@
+# Same as resources_only.yaml, with the BGE-M3 hybrid retriever and 3 chunks for each search.
+# The chunk encodings are cached in m3_cache/ (git-ignored): the first start takes about 80 s, later starts about 3 s.
+# Start:  cd NeMo_Gym && resources_servers/mission_search/.venv/bin/ng_run "+config_paths=[resources_servers/mission_search/configs/resources_only_bge_m3.yaml]" +skip_venv_if_present=true
+mission_search_resources_server:
+  resources_servers:
+    mission_search:
+      entrypoint: app.py
+      domain: other
+      verified: false
+      retriever: bge_m3
+      top_k: 3
+      # m3_dir: ../../../Embedder/bge-m3    # relative to the server folder
+      # m3_cache_dir: m3_cache

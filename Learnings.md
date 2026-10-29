@@ -7,7 +7,7 @@
 | Project | Train a small model to answer questions with a search tool |
 | Scope | Changes in approach and changes in tests |
 | Not in scope | Package problems. See `Dependency_hell.md`. |
-| Last update | 2026-10-07 |
+| Last update | 2026-10-27 |
 
 ## 1. How to read this file
 
@@ -70,6 +70,24 @@ Use the same name for the same thing every time.
 | token F1 | A number from 0 to 1 for the words that two texts share | F-score |
 | containment | The case where the expected answer is a run of whole words inside the final answer | substring match |
 | length cap | The largest number of words in a final answer that gets 1.0 by containment | word limit |
+| retriever | The code that finds the chunks for a query. Today it is `CorpusSearcher` with NoInstruct and Chroma. | search engine |
+| NoInstruct | The small embedder of the server today (33M parameters) | the model |
+| BGE-M3 | A larger embedder (568M parameters). One pass gives three scores: dense, sparse and ColBERT. | M3 model |
+| dense score | The score from one vector for the whole text | semantic score |
+| sparse score | The score from the weight of each token that the query and the chunk share | lexical score |
+| ColBERT score | The score from the best match of each query token in the chunk, averaged | multi-vector score |
+| lexical hit | One search result holds at least 60% of the content words of the expected answer | word hit |
+| provenance hit | A retrieved chunk overlaps the window that the question came from | source hit |
+| source support | The share of the content words of the expected answer that the source window holds | grounding |
+| training run | One training from the first step to the last step, with its own folder in `trainer/runs` | run (alone) |
+| checkpoint | The LoRA weights that the trainer saves at one step | snapshot |
+| group | The 8 attempts at one prompt | batch |
+| advantage | The number that shows how much better one attempt is than the mean of its group | bonus |
+| answer-only reward | The reward from the final answer alone, without the retrieval part | base reward |
+| combined reward | The reward that the trainer uses: the answer part plus the retrieval part | total reward |
+| retrieved | The share of questions with a lexical hit | found |
+| contains | The share of final answers that hold the expected answer, whatever their length | match rate |
+| paired change | The mean over the same questions of (reward of the model minus reward of the base model) | difference |
 
 ## 3. Learnings
 
@@ -490,6 +508,216 @@ The first start did not install anything. The embedder loaded one time at the st
 
 **Where.** `NeMo_Gym/resources_servers/mission_search/configs/resources_only.yaml`. The agent code goes in `trainer/rollout.py` (step 5).
 
+### L15. Read the reward the way the optimizer reads it
+
+**Problem.** The reward went up in the first runs, but we did not know which signal the trainer used. The 1B smoke run gave its highest rewards to text that was not an answer.
+
+**Cause.** GRPO does not use the reward itself. It uses the difference between each attempt and the mean of its group of 8. TRL then divides this difference by the standard deviation of the group.
+
+**What we measured** in the 200 groups of run 1:
+
+- 31 groups had 8 equal rewards. They gave no signal.
+- 83 groups had an exact answer and a non-exact answer. They gave a clean signal.
+- 86 groups had no exact answer. Their signal came only from small F1 differences.
+- In 60 groups the standard deviation was below 0.1. The division gave an advantage of up to +2.3 to a difference of 0.02.
+
+**Solution.** We took three steps:
+
+1. The F1 counts content words only. A text of small words gets 0.0.
+2. Run 2 sets `scale_rewards="none"`. TRL does not divide the difference.
+3. We compare runs with the answer-only reward on fixed questions (L17), not with the training reward.
+
+**Rule.**
+
+- Write down the order of the outcomes before you choose numbers.
+- Count the groups with no signal, with a clean signal and with a noise signal.
+- Add a part to the reward only where the main signal is weak.
+
+**Where.** `token_f1` in `NeMo_Gym/resources_servers/mission_search/app.py`. `HYPERPARAMETERS` in `trainer/train_grpo.py`.
+
+### L16. Add a retrieval part to the reward and measure its share first
+
+**Problem.** The reward gave no credit for a good search. A good search with a wrong answer scored the same as no search.
+
+**Solution.** Run 2 uses `reward = 0.75 x answer + 0.25 x gate x ret`:
+
+1. `cov_k` is the share of the content words of the expected answer that the result of search k holds.
+2. `s_k` is a ramp: 0 below 0.3, 1 at 0.6 and above.
+3. `ret` is the largest value of `0.5^(k-1) x s_k` over the searches. Extra searches add nothing after a hit.
+4. `gate` is 1 if the trajectory ends with a final message. Spam to the turn cap scores 0.
+
+A correct answer with a hit scores 1.0. A correct answer without a hit scores 0.75. A hit with no usable answer scores at most 0.25.
+
+**Result.** The retrieval part carried 7% of the variance inside the groups. The answer part carried 78%. The covariance carried 16%. The retrieval part changed in 70 of 200 groups, and in 34 of the 112 groups with no exact answer. Retrieval did not improve: `retrieved` was 0.72 for the base model and 0.68 for run 2.
+
+We think the 8 attempts of a group send almost the same query. We did not test this.
+
+**Choices that we did not make.** We gave no negative reward for a bad call. Bad calls were 0% at the end of run 1, so a penalty has no target. A penalty also gives the model a reason to avoid the tool. A penalty for consecutive misses punishes a retry, and a retry is the only way to recover from a bad first search.
+
+**Rule.**
+
+- Measure how much of the variance inside the groups a new part carries. A part under 10% does not steer the model.
+- Keep each part small, bounded and gated.
+- Test each part against the ways to farm it. Spam, search and no answer, and search and ignore all score low.
+
+**Where.** `retrieval_score` and `combine` in `app.py`. The tests are in `tests/test_app.py`.
+
+### L17. Judge the runs with one fixed yardstick
+
+**Problem.** The training reward comes from sampling at temperature 0.9 on a new question at each step. It does not compare two models.
+
+**Solution.** `eval.py` makes the yardstick:
+
+1. It decodes greedily (temperature 0). The same 148 questions run in the same order with the pinned date.
+2. The headline is the answer-only reward. It stays the same after run 2 changed the training reward.
+3. The base model runs through the same code, with no adapter.
+4. The paired change against the base model comes with its standard error.
+5. The metric `contains` does not depend on the length cap.
+
+**Evidence of determinism.** We evaluated the base model in two run folders, six days apart. All 148 trajectories were identical: the queries, the retrieved text and the answers.
+
+**Result.**
+
+| Model | Answer-only reward | Exact |
+|---|---|---|
+| Base | 0.191 | 0.15 |
+| Run 1 at step 200 | 0.461 | 0.36 |
+| Run 2 at step 200 | 0.499 | 0.41 |
+
+The paired change of run 2 against run 1 is +0.039 ± 0.020. That is 1.9 standard errors. Each run used one training seed, so this is not proof.
+
+**Limits.**
+
+- One greedy run for each model, on 148 questions. 130 of them are different texts (L18).
+- GPU arithmetic changes with the batch size. Keep `--limit` and the chunk size of 32 the same between runs that you compare.
+- A new index or a new verifier changes the yardstick. Run the base model again.
+- Training is not deterministic. A resume gave weights that differed by 1.4%.
+
+**Rule.** Evaluate with one fixed set of settings. Never judge a run with the number that it trained on.
+
+**Where.** `trainer/eval.py`.
+
+### L18. The score has two factors, and part of the data is weak
+
+**Problem.** The exact rate stops near 0.4 on the validation set.
+
+**Cause.** The score is the product of two rates. 68% of the questions had a lexical hit. For 62% of those, the answer is in the final text. 0.68 x 0.62 is about 0.42. Without a hit, the answer is in the final text in 2% of the cases.
+
+**What the report shows** for the 148 questions:
+
+| Category | Base | Run 1 | Run 2 |
+|---|---|---|---|
+| Success | 22 | 53 | 61 |
+| Answer only inside `<reasoning>` | 32 | 0 | 0 |
+| Retrieval miss | 31 | 44 | 40 |
+| Right evidence, partial credit or wrong answer | 39 | 39 | 36 |
+| False-hit suspect | 10 | 8 | 6 |
+| Suspect bad reference | 4 | 4 | 4 |
+| No usable final answer | 10 | 0 | 1 |
+
+**Data findings.**
+
+- 18 of the 148 validation rows repeat a question. The windows overlap, so two windows give the same question. 7 of the repeats have different references. In the train set, 110 of 1,240 rows repeat.
+- Some references do not answer the question. One asks for the reason of an engine cutoff and gives the time of the cutoff. Both trained models gave a better answer than the reference and lost points.
+- Some questions are not self-contained ("the first part of the maneuver").
+- OCR swaps digits for letters. 1.3% of the references have such a token. 222 of the 510 chunks have one (`l3` for `13`).
+- 25% of the validation questions have no chunk of their window in the top 5, even with the question as the query. Many of them are mission-level questions with answers in several places.
+
+**Rule.**
+
+- A semantic judge inherits the errors of the reference. Clean the references before you build the judge.
+- Remove repeated questions before you make a split.
+
+**Where.** `scripts/report.py` writes the report. `scripts/rescore_dump.py` scores a dump again.
+
+### L19. Compare the retrievers on the chunks before you train
+
+**Problem.** Retrieval is the first factor of the ceiling. We did not know whether BGE-M3 finds better chunks than NoInstruct.
+
+**Solution.** `retrieval_bench.py` runs both on the same 510 chunks and the same queries, with exact search on the CPU. BGE-M3 has three scores. We built them from the model files and tested them against the example scores in the model card. The combined score uses the weights of the model card: dense 0.4, sparse 0.2, ColBERT 0.4. It divides the sum by the sum of the weights.
+
+**Result.** The table shows provenance at top 2 and top 5.
+
+| Query set | NoInstruct | BGE-M3 all three |
+|---|---|---|
+| All 1,434 questions | 0.771 and 0.873 | 0.895 and 0.955 |
+| 148 validation questions | 0.649 and 0.750 | 0.824 and 0.932 |
+| Queries of the trained model | 0.649 and 0.736 | 0.824 and 0.946 |
+
+**Other results.**
+
+- BGE-M3 at top 2 beats NoInstruct at top 5.
+- ColBERT is the best single score. Sparse is better than dense. All three together are about equal to ColBERT alone.
+- From top 2 to top 3 the gain is 8 points. From top 3 to top 5 it is 2.7 points.
+- The OCR repair does not raise provenance. It raises the word-overlap coverage by about 2 points, because the spelling becomes equal.
+- L2 distance, cosine and dot product give the same result with NoInstruct, because the vectors have almost the same length.
+- The queries of the trained model find the chunks as well as the question itself.
+- On the CPU, one chunk takes 162 ms and one query takes 15 ms. The NoInstruct values are 27 ms and 4 ms.
+
+**Limits.** An LLM wrote each question from its window. This favours scores that match words. The validation set is harder than the mean of all questions.
+
+**Rule.** Measure a new retriever on the chunks with exact search before you change the server. Test your own implementation against the published example scores.
+
+**Where.** `scripts/retrieval_bench.py` and `tests/test_retrieval_bench.py`. The results are in `trainer/runs/retrieval_bench`.
+
+### L20. Make a long run safe to stop
+
+**Problem.** A 200-step run lasts about one hour. A crash at step 130 costs the whole run unless the run saves its state.
+
+**Solution.**
+
+1. `train_grpo.py` makes one folder for each training run. It saves a checkpoint every 50 steps and the `final` weights at the end.
+2. `--resume` continues from a checkpoint in the same folder with the saved settings.
+3. It stops if a constant or a hyperparameter in the code differs from the saved run.
+4. It moves the dump lines of the steps after the checkpoint to a side file. It never deletes them.
+5. We tested the resume on a copy of a test run. The learning rate and the step numbers came back.
+
+**Rule.** Test a resume before the long run. Never edit `app.py` or the constants during a run.
+
+**Where.** `main` in `trainer/train_grpo.py`. `prune_dump_after_step` in `trainer/rollout.py`.
+
+### L21. Disk space under WSL2
+
+**Problem.** WSL2 keeps the distribution in one disk file. The file grows and does not shrink. We deleted a copy of the model, and the space did not come back to drive C.
+
+**Facts.**
+
+- Space that we free inside WSL stays in the file. WSL reuses it for new files. A new copy of the same size does not grow the file.
+- No setting named `autocompact` exists, as far as we found. The sparse disk option exists (`sparseVhd`). Recent WSL versions marked it as unsafe because of a risk of data corruption. The manual compaction tools do not work on a sparse disk.
+- On 2026-10-23 the file was 177 GB and WSL used 159 GB. WSL was version 2.6.3.
+
+**Solution.** We do not use the sparse option. When drive C is short on space, we free files inside WSL, run `wsl --shutdown`, and compact the file offline with `Optimize-VHD` or `diskpart`. We back up first. We did not run the compaction yet.
+
+**Rule.** Delete the large files inside WSL before you compact. Keep model weights out of git. Git ignores `Embedder/`.
+
+**Where.** `.gitignore`.
+
+### L22. Test a loader on data of real size, under a memory limit
+
+**Problem.** The first BGE-M3 retriever ran out of memory when it loaded its cache. One Python process grew to 31 GB, and the system stopped it. WSL stopped three times. The cache file was only 251 MB.
+
+**Facts.**
+
+- The cache was one `.npz` file. NumPy reads an array from an `.npz` file each time the code asks for it by name. The code asked for the whole ColBERT array once for each of the 510 chunks. Each request made a new copy of 249 MB. The copies added up to about 127 GB.
+- The cost grows with the square of the number of chunks. A test with 5 chunks did not show the problem.
+- A process limit (`ulimit -v`) limits the virtual address space. It does not limit the resident memory. In our tests, the virtual size was 2 to 7 times the resident size.
+- A limit of 2 times the resident peak stopped the tests with no real memory problem. A limit of 2 times the virtual peak is almost all of the 31 GB of RAM, so it protects nothing.
+- A child process reports `ru_maxrss` with the memory of its parent at the time of the fork. Read `VmHWM` from `/proc/self/status` in the child.
+- Each retriever loaded its own copy of the model (2.3 GB). Six loads in the tests gave a resident peak of 4.5 GB. One shared model gave 2.7 GB.
+
+**Solution.**
+
+- Store each array of the cache in its own `.npy` file. Open the files with `mmap_mode="r"`. The six arrays are: dense, ColBERT tokens with their offsets, and the sparse weights in CSR form (pointers, indices, data).
+- Write a manifest. It records the shapes, the types, the model revision, the chunk hash, and the chunking settings. The name of the cache folder is a hash of the manifest.
+- Read the size from the manifest before the load. Refuse a load that is larger than 2 GiB.
+- Compute the ColBERT scores in blocks. The temporary matrix stays under 256 MiB.
+- Let the retriever accept a loaded model. The tests share one model.
+- Run one test with arrays of real size in a child process that has a 3 GB limit. The old loader fails this test.
+
+**Rule.** Test each loader with data of real size and under a hard memory limit. Break the code on purpose, and make sure that the test fails. Measure the limit. Do not guess it.
+
+**Where.** `m3.py`, `retriever.py`, `tests/test_retriever.py`, `tests/conftest.py`.
+
 ## 4. Procedures
 
 ### 4.1 Make the data files
@@ -538,16 +766,67 @@ The build takes about 20 s. To keep all 753 chunks, add `--min-chars 0`. To test
 8. Send a row to `/verify` with a correct final answer. Make sure that the reward is 1.0. Use a wrong final answer. Make sure that the reward is 0.0.
 9. Press Ctrl+C in the first terminal. Use `ps` to make sure that no `app.py` process stays.
 
-To run the unit tests, go to `NeMo_Gym`. Run `resources_servers/mission_search/.venv/bin/python -m pytest resources_servers/mission_search/tests`. Make sure that all 14 tests pass.
+To run the unit tests, go to `NeMo_Gym`. Run `resources_servers/mission_search/.venv/bin/python -m pytest resources_servers/mission_search/tests`. Make sure that all tests pass.
+
+### 4.5 Train
+
+> CAUTION: Do not start while another program uses the GPU. A training run uses up to 20 GB of GPU memory.
+
+1. Start the server (procedure 4.4). Do not close its terminal.
+2. Go to the `trainer` folder.
+3. Run `temp/.venv-temp/bin/python train_grpo.py --max-steps 200 --save-steps 50 --name <name> 2>&1 | tee <name>.log`.
+4. Find the line `[train] run folder:`.
+5. After the first step, look in `train_dump.jsonl` for the field `reward_answer`. If it is missing, the server runs an old verifier. Stop and restart the server.
+6. Do not change `app.py` or the constants in `train_grpo.py` during the run.
+7. After a crash, run `train_grpo.py --resume runs/<run>/checkpoint-<N>` with the highest N.
+
+A test run uses `--max-steps 4 --save-steps 2`. It takes about 4 minutes.
+
+### 4.6 Evaluate
+
+1. Start the server (procedure 4.4). Make sure that the GPU is free.
+2. Go to the `trainer` folder.
+3. Run `temp/.venv-temp/bin/python eval.py --run-dir runs/<run> --checkpoints runs/<run>/checkpoint-50 runs/<run>/checkpoint-100 runs/<run>/checkpoint-150 runs/<run>/checkpoint-200`.
+4. Read the table at the end. The column `reward` is the answer-only reward.
+5. Wait about 25 minutes for the base model and four checkpoints.
+
+For a fast check, add `--limit 16`.
+
+### 4.7 Make the report
+
+1. Go to the repository root.
+2. Run `NeMo_Gym/resources_servers/mission_search/.venv/bin/python NeMo_Gym/resources_servers/mission_search/scripts/report.py --run-dir <run folder> --model "<label>=<path to an eval dump>"`. Repeat `--model` for each model, up to four.
+3. Open `<run folder>/report.html` in a browser. In WSL, run `explorer.exe "$(wslpath -w <file>)"`.
+
+### 4.8 Run the retrieval benchmark
+
+1. Go to the repository root. Make sure that BGE-M3 is in `Embedder/bge-m3`.
+2. Run `NeMo_Gym/resources_servers/mission_search/.venv/bin/python NeMo_Gym/resources_servers/mission_search/scripts/retrieval_bench.py --model-queries <eval dump>`.
+3. Wait about 10 minutes. The script uses the CPU only.
+4. Read the tables. The results also go to `trainer/runs/retrieval_bench`.
+
+For a fast check, add `--limit 60 --no-repair`.
+
+### 4.9 Run the tests with a memory limit
+
+1. Go to the folder `NeMo_Gym/resources_servers/mission_search`.
+2. Run `(ulimit -v 25165824; .venv/bin/python -m pytest tests)`.
+3. Make sure that all tests pass (78 tests on 2026-10-29).
+4. To find a new limit, run the tests with a script that prints `VmPeak` and `VmHWM` from `/proc/self/status` at the end.
+5. Set the limit to 1.5 times `VmPeak`. It must stay below the RAM of WSL (31 GB).
 
 ## 5. Open items
 
-- The Llama chat template puts quotation marks around the content of a tool message. We probably do not want this for search results. Decide how to add the search results, and run the prefix check again.
-- A reasoning model can remove or shorten old turns. TITO does not work after such a change. Keep the text before the last change as the prompt, and train only on the tokens after it.
-- Hold out a second set for a final test when we start to tune against the validation set.
-- Delete the counter for the old render method after we measure it on a larger sample.
-- The retrieval test never tests the last 16% of the questions. Use a larger step, so that the sample covers the whole file.
+- The Llama chat template puts quotation marks around the tool text. We kept this for version 1. Compare quoted and plain text after the retriever change.
+- Some reasoning models remove or shorten old turns. TITO does not work after such a change. Keep the text before the last change as the prompt, and train only on the tokens after it.
+- Hold out a second set for a final test when we tune against the validation set.
+- The retrieval test in `build_index.py` never tests the last 16% of the questions. Use a larger step, so that the sample covers the whole file.
 - `Debug_checks.md` and the pictures in `Schema_learning` show the index before the merge (753 chunks and the old line numbers). Update them before the next debug session.
-- Check the expected answers. After the first rollouts, find the questions that no attempt scores on. Read them with their chunks.
+- Audit the questions and the references (Plan, step 8). Count the defects by type before we decide to write new questions.
 - Measure the length cap (5 x expected words + 15) on a larger dump. Look at the final answers that get 1.0 by containment.
-- Decide on a bonus for a tool call after the first rollouts show how often the model calls the tool.
+- The ramp of the retrieval part (0.3 to 0.6) fits NoInstruct at top 2. Fit it again for the new retriever, or drop the part (L16).
+- Run 2 changed two things. Run an ablation with the scaling change alone if the cause matters. One run costs about 1 hour, and the evaluation about 25 minutes.
+- Remove the repeated question rows from the data (L18). Decide whether git tracks `data/train.jsonl` and `data/validation.jsonl`. The scaffold ignores them, and git also ignores `Step2_Files`.
+- Put the path of BGE-M3 in a config value before the server loads it.
+- A `top_k` of 3 gives about 420 tokens for each search. Raise `MAX_COMPLETION` and `MAX_SEQ`, and check the VRAM. The peak was 19.9 GB of 24.4 GB.
+- Compact the WSL disk file when drive C is short on space (L21).

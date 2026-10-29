@@ -7,6 +7,8 @@ NeMo_Gym/outputs/
 NeMo_Gym/.pytest_cache/
 # rebuilt from the chunks by scripts/build_index.py
 NeMo_Gym/resources_servers/mission_search/chroma_index/
+# cached BGE-M3 chunk encodings (about 290 MB), rebuilt on the first start
+NeMo_Gym/resources_servers/mission_search/m3_cache/
 
 # training runs: each checkpoint is about 1 GB
 trainer/runs/

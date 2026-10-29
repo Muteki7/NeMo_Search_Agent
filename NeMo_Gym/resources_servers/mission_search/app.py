@@ -3,7 +3,7 @@
 """Resources server for the Apollo 13 mission-report search task.
 
 Two jobs:
-  - `POST /search_corpus` : the tool. Embeds the query and returns the top-k chunks from the Chroma index (step 3).
+  - `POST /search_corpus` : the tool. Finds the top-k chunks for the query (retriever.py: Chroma + NoInstruct, or BGE-M3 hybrid in memory).
   - `POST /verify`        : the reward. Compares the final answer of the model with the expected answer.
 `verify` does not read the index. It is a pure function of the request body, so REVERIFY_MODE is STATELESS.
 """
@@ -13,7 +13,7 @@ import string
 import sys
 from collections import Counter
 from pathlib import Path
-from typing import ClassVar, Optional
+from typing import ClassVar, Literal, Optional
 
 from fastapi import FastAPI
 from pydantic import BaseModel, ConfigDict, PrivateAttr
@@ -40,6 +40,12 @@ class MissionSearchResourcesServerConfig(BaseResourcesServerConfig):
     collection_name: str = "example_collection"
     embedding_model: str = "avsolatorio/NoInstruct-small-Embedding-v0"
     top_k: int = 2  # the old AutoDidact loop used 2 results per search
+    # Which retriever answers a search. "chroma" is the original (NoInstruct + Chroma). "bge_m3" scores all chunks in memory with the BGE-M3
+    # hybrid (dense 0.4, sparse 0.2, ColBERT 0.4) and caches the chunk encodings in m3_cache_dir. Relative paths start in this folder.
+    retriever: Literal["chroma", "bge_m3"] = "chroma"
+    m3_dir: str = "../../../Embedder/bge-m3"
+    m3_cache_dir: str = "m3_cache"
+    chunks_path: str = "data/chunks.jsonl"  # the chunk store (text and metadata keyed by id). Create it once with scripts/export_chunks.py. The server never writes it.
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -54,27 +60,29 @@ class SearchCorpusResponse(BaseModel):
 
 
 class CorpusSearcher:
-    """The Chroma index plus the embedder. Loaded once. Needs chromadb, langchain-chroma, torch and transformers."""
+    """A retriever (retriever.py) plus the text format of the tool result. Loaded once."""
 
-    def __init__(self, chroma_dir: Path, collection_name: str, embedding_model: str, top_k: int):
-        from langchain_chroma import Chroma
-        from embeddings import CustomHuggingFaceEmbeddings
+    def __init__(self, chroma_dir: Path, collection_name: str, embedding_model: str, top_k: int,
+                 retriever: str = "chroma", m3_dir: Optional[Path] = None, m3_cache_dir: Optional[Path] = None, chunks_path: Optional[Path] = None,
+                 m3_model=None):
+        from retriever import BGEM3Retriever, ChromaRetriever, load_chunks
 
         if not chroma_dir.is_dir():
             raise FileNotFoundError(f"Chroma index not found at {chroma_dir}. Build it with scripts/build_index.py.")
-        # The same class that built the index: documents use [CLS] pooling, queries use mean pooling.
-        embeddings = CustomHuggingFaceEmbeddings(model_name=embedding_model)
-        self.vectorstore = Chroma(
-            collection_name=collection_name,
-            embedding_function=embeddings,
-            persist_directory=str(chroma_dir),
-        )
+        if retriever == "chroma":
+            self.retriever = ChromaRetriever(chroma_dir, collection_name, embedding_model)
+        elif retriever == "bge_m3":
+            # The chunks come from the chunk store (written from the same index by scripts/export_chunks.py), so they do not change with the retriever.
+            chunks, meta = load_chunks(chunks_path or chroma_dir.parent / "data" / "chunks.jsonl")
+            self.retriever = BGEM3Retriever(chunks, m3_dir, m3_cache_dir, chunking=meta.get("chunking"), model=m3_model)    # m3_model: an already loaded model (tests)
+        else:
+            raise ValueError(f"unknown retriever {retriever!r}: use 'chroma' or 'bge_m3'")
         self.top_k = top_k
 
     def search(self, query: str) -> str:
         """Same output format as AutoDidact search_module.search: 'Result i:', the chunk text, then '------'."""
-        results = self.vectorstore.similarity_search(query, k=self.top_k)
-        return "".join(f"Result {i}:\n{doc.page_content}\n------\n" for i, doc in enumerate(results, start=1))
+        from retriever import format_results
+        return format_results(self.retriever.search(query, self.top_k))
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -255,13 +263,15 @@ class MissionSearchResourcesServer(MissionSearchVerifier, SimpleResourcesServer)
     def setup_webserver(self) -> FastAPI:
         app = super().setup_webserver()
 
-        chroma_dir = Path(self.config.chroma_dir)
+        def resolve(path: str) -> Path:
+            return Path(path) if Path(path).is_absolute() else (SERVER_DIR / path).resolve()
+
+        cfg = self.config
         self._searcher = CorpusSearcher(
-            chroma_dir if chroma_dir.is_absolute() else SERVER_DIR / chroma_dir,
-            self.config.collection_name,
-            self.config.embedding_model,
-            self.config.top_k,
+            resolve(cfg.chroma_dir), cfg.collection_name, cfg.embedding_model, cfg.top_k,
+            retriever=cfg.retriever, m3_dir=resolve(cfg.m3_dir), m3_cache_dir=resolve(cfg.m3_cache_dir), chunks_path=resolve(cfg.chunks_path),
         )
+        print(f"[search] retriever {cfg.retriever}, top_k {cfg.top_k}")
         # The route name must equal the tool name in the data rows ("search_corpus"): simple_agent and our
         # rollout_func both POST a tool call to /{tool name}.
         app.post("/search_corpus")(self.search_corpus)
