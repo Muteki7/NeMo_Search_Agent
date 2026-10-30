@@ -32,3 +32,6 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .venv/
+
+#Learning files
+Schema_learning/

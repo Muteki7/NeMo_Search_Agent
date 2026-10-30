@@ -24,7 +24,7 @@ Research findings that shape the design:
 
 ```
 NeMo_search_agent/                         # the repository
-├── Plan.md, Learnings.md, Dependency_hell.md, Debug_checks.md, rules.md, ASD-STE100.jpeg
+├── Plan.md, Learnings.md, Dependency_hell.md, rules.md, ASD-STE100.jpeg
 ├── docs/results.svg                       # the results chart, made by trainer/plot_results.py; tracked
 ├── Step2_Files/                           # AutoDidact files (questions.json, chunks.pkl, ...); git-ignored
 ├── Embedder/bge-m3/                       # BGE-M3 weights (2.2 GB), loaded from this path; git-ignored

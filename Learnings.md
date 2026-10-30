@@ -886,7 +886,7 @@ For a fast check, add `--limit 60 --no-repair`.
 - Some reasoning models remove or shorten old turns. TITO does not work after such a change. Keep the text before the last change as the prompt, and train only on the tokens after it.
 - Hold out a second set for a final test when we tune against the validation set.
 - The retrieval test in `build_index.py` never tests the last 16% of the questions. Use a larger step, so that the sample covers the whole file.
-- `Debug_checks.md` and the pictures in `Schema_learning` show the index before the merge (753 chunks and the old line numbers). Update them before the next debug session.
+- The pictures in `Schema_learning` and the local debug notes (not in the repository) show the index before the merge (753 chunks and the old line numbers). Update them before the next debug session.
 - Audit the questions and the references (Plan, step 8). Count the defects by type before we decide to write new questions.
 - Measure the length cap (5 x expected words + 15) on a larger dump. Look at the final answers that get 1.0 by containment.
 - The ramp of the retrieval part (0.3 to 0.6) fits NoInstruct at top 2. Fit it again for the new retriever, or drop the part (L16).
