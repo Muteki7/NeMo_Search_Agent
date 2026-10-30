@@ -23,6 +23,7 @@ trainer/*.log
 SESSION_HANDOFF.md
 Setup.md
 Debug_checks.md
+rules.md
 
 # local model weights (BGE-M3 copy, 4 GB): never commit
 Embedder/
@@ -35,3 +36,4 @@ __pycache__/
 
 #Learning files
 Schema_learning/
+
