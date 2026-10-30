@@ -6,6 +6,7 @@ Two jobs:
   - `POST /search_corpus` : the tool. Finds the top-k chunks for the query (retriever.py: Chroma + NoInstruct, or BGE-M3 hybrid in memory).
   - `POST /verify`        : the reward. Compares the final answer of the model with the expected answer.
 `verify` does not read the index. It is a pure function of the request body, so REVERIFY_MODE is STATELESS.
+With `semantic_credit: true` it also needs the BGE-M3 weights (a fixed model, no state that changes between calls).
 """
 import asyncio
 import re
@@ -46,6 +47,9 @@ class MissionSearchResourcesServerConfig(BaseResourcesServerConfig):
     m3_dir: str = "../../../Embedder/bge-m3"
     m3_cache_dir: str = "m3_cache"
     chunks_path: str = "data/chunks.jsonl"  # the chunk store (text and metadata keyed by id). Create it once with scripts/export_chunks.py. The server never writes it.
+    # Extra credit for a correct answer in other words (see semantic_credit). Off by default: the reward is then the same as in runs 1 and 2.
+    # On, the server loads BGE-M3 on the CPU (one copy, shared with the bge_m3 retriever).
+    semantic_credit: bool = False
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -164,6 +168,46 @@ def score_answer(final_text: Optional[str], expected: str) -> float:
     return token_f1(prediction, expected_tokens)
 
 
+# Number guard for the semantic credit (not used by score_answer yet). A semantic score alone gives credit to an answer with one wrong
+# number (on 44 such answers made from correct ones, 73 to 95% were still above the threshold, whatever the mode). So the credit needs
+# every number of the reference in the answer. Digits only: a number written as a word ("forty-two") is not seen.
+NUMBER_PATTERN = re.compile(r"\d+(?:[ ,.]\d{3})*(?:\.\d+)?")
+
+
+def numbers_in(text: str) -> list:
+    """The numbers of `text` as strings without thousands separators: '35,560' and '35 560' both give '35560', '2:35:46.4' gives 2, 35, 46.4."""
+    return [re.sub(r"[ ,]", "", m.group()) for m in NUMBER_PATTERN.finditer(text)]
+
+
+def number_guard(final_text: Optional[str], expected: str) -> bool:
+    """True if every number of the expected answer appears in the final answer (reasoning removed). True when the expected answer has no number."""
+    if final_text is None:
+        return False
+    found = set(numbers_in(remove_reasoning(final_text)))
+    return all(n in found for n in numbers_in(expected))
+
+
+# Semantic credit (decided 2026-10-30, option A). An answer that scores below SEMANTIC_POINTS by the rules above gets SEMANTIC_POINTS if the number
+# guard passes and the ColBERT score (reference as the query, BGE-M3) is at least SEMANTIC_THRESHOLD. It never lowers a reward, and an exact
+# match (1.0) stays the best. On 72 hand labels the threshold 0.65 gave credit to 24 of 26 correct answers that the rules under-credited and
+# to none of 9 wrong answers (chosen on the same labels). The credit is below 1.0 so that an exact answer still earns more.
+# Known gap: a wrong answer without a number (row 97 of the run-2 eval, score 0.66) gets the credit. Freeze these numbers for a run.
+SEMANTIC_THRESHOLD = 0.65
+SEMANTIC_POINTS = 0.85
+
+
+def semantic_credit(answer_reward: float, final_text: Optional[str], expected: str, model) -> tuple:
+    """(answer reward after the credit, ColBERT score or None). The score is None when it was not worked out: no model, no final answer, a
+    reward that is already at SEMANTIC_POINTS or above, or a failed number guard (the cheap checks come first, so the model runs only when needed)."""
+    if model is None or final_text is None or not expected.strip() or answer_reward >= SEMANTIC_POINTS or not number_guard(final_text, expected):
+        return answer_reward, None
+    text = remove_reasoning(final_text).strip()
+    if not text:
+        return answer_reward, None
+    score = model.reference_coverage(expected, text)
+    return (SEMANTIC_POINTS if score >= SEMANTIC_THRESHOLD else answer_reward), score
+
+
 def final_message_text(output: list) -> Optional[str]:
     """Text of the LAST `message` item of the response output (the final answer), or None if there is none.
     In a multi-turn rollout the earlier items are function_call and function_call_output (and earlier messages)."""
@@ -229,7 +273,9 @@ class MissionSearchVerifyRequest(BaseVerifyRequest):
 class MissionSearchVerifyResponse(BaseMultiRewardVerifyResponse):
     # `reward` is the combined value that the trainer uses. The parts are also top-level fields, so a caller can read the
     # answer-only reward (the yardstick for comparing runs) and the retrieval numbers.
-    reward_answer: float = 0.0       # R_answer: the answer reward alone (what run 1 trained on)
+    reward_answer: float = 0.0       # R_answer: the answer reward alone (what run 1 trained on). Always the rules of score_answer, never the semantic credit, so it stays the yardstick between runs.
+    reward_answer_semantic: float = 0.0  # R_answer after the semantic credit. The same as reward_answer when semantic_credit is off. `reward` is built from this one.
+    semantic_score: float = -1.0     # the ColBERT score of the answer, or -1.0 when it was not worked out (see semantic_credit)
     reward_retrieval: float = 0.0    # ret, before the gate
     retrieval_gate: float = 0.0      # 1.0 if the trajectory ended with a final message
     best_cov: float = 0.0            # the best cov_k over the searches, without the discount
@@ -240,13 +286,20 @@ class MissionSearchVerifier:
     async def verify(self, body: MissionSearchVerifyRequest) -> MissionSearchVerifyResponse:
         final_text = final_message_text(body.response.output)
         answer_reward = score_answer(final_text, body.answer)
+        model = getattr(self, "_semantic_model", None)      # set by the server when semantic_credit is on; the plain verifier (tests) has none
+        if model is None:
+            credited, semantic = answer_reward, None
+        else:
+            # The CPU embedding blocks. Run it in a thread so that parallel rollouts do not stall the event loop.
+            credited, semantic = await asyncio.to_thread(semantic_credit, answer_reward, final_text, body.answer, model)
         ret, best_cov, n_searches = retrieval_score(body.response.output, body.answer)
         answered = final_text is not None
         return MissionSearchVerifyResponse(
             **body.model_dump(),
-            reward=combine(answer_reward, ret, answered),
-            reward_components={"answer": answer_reward, "retrieval": ret if answered else 0.0},
-            reward_answer=answer_reward, reward_retrieval=ret, retrieval_gate=float(answered),
+            reward=combine(credited, ret, answered),
+            reward_components={"answer": credited, "retrieval": ret if answered else 0.0},
+            reward_answer=answer_reward, reward_answer_semantic=credited, semantic_score=-1.0 if semantic is None else semantic,
+            reward_retrieval=ret, retrieval_gate=float(answered),
             best_cov=best_cov, n_searches=float(n_searches),
         )
 
@@ -259,6 +312,7 @@ class MissionSearchResourcesServer(MissionSearchVerifier, SimpleResourcesServer)
 
     config: MissionSearchResourcesServerConfig
     _searcher: Optional[CorpusSearcher] = PrivateAttr(default=None)  # set in setup_webserver
+    _semantic_model: Optional[object] = PrivateAttr(default=None)    # the BGE-M3 model for the semantic credit; None when semantic_credit is off
 
     def setup_webserver(self) -> FastAPI:
         app = super().setup_webserver()
@@ -267,11 +321,21 @@ class MissionSearchResourcesServer(MissionSearchVerifier, SimpleResourcesServer)
             return Path(path) if Path(path).is_absolute() else (SERVER_DIR / path).resolve()
 
         cfg = self.config
+        m3_model = None
+        if cfg.retriever == "bge_m3" or cfg.semantic_credit:
+            import m3
+            m3_dir = resolve(cfg.m3_dir)
+            if not (m3_dir / "pytorch_model.bin").exists():
+                raise FileNotFoundError(f"BGE-M3 not found in {m3_dir}. Expected pytorch_model.bin, colbert_linear.pt and sparse_linear.pt there.")
+            m3_model = m3.BGEM3(m3_dir)     # one copy (2.3 GB) for the retriever and the verifier
         self._searcher = CorpusSearcher(
             resolve(cfg.chroma_dir), cfg.collection_name, cfg.embedding_model, cfg.top_k,
             retriever=cfg.retriever, m3_dir=resolve(cfg.m3_dir), m3_cache_dir=resolve(cfg.m3_cache_dir), chunks_path=resolve(cfg.chunks_path),
+            m3_model=m3_model,
         )
+        self._semantic_model = m3_model if cfg.semantic_credit else None
         print(f"[search] retriever {cfg.retriever}, top_k {cfg.top_k}")
+        print(f"[verify] semantic credit {'on (threshold %s, points %s)' % (SEMANTIC_THRESHOLD, SEMANTIC_POINTS) if cfg.semantic_credit else 'off'}")
         # The route name must equal the tool name in the data rows ("search_corpus"): simple_agent and our
         # rollout_func both POST a tool call to /{tool name}.
         app.post("/search_corpus")(self.search_corpus)

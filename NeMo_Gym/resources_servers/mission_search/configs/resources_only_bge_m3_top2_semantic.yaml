@@ -1,0 +1,14 @@
+# Same as resources_only_bge_m3_top2.yaml, with the semantic credit on: an answer in other words gets 0.85 if every number of the reference is in the answer
+# and the BGE-M3 ColBERT score (reference as the query) is at least 0.65 (app.py: SEMANTIC_THRESHOLD, SEMANTIC_POINTS). The server loads one BGE-M3 (2.3 GB) for
+# the retriever and the verifier. `reward_answer` in the replies is still the answer reward of the old rules, so evals with this config stay comparable.
+# Start:  cd NeMo_Gym && resources_servers/mission_search/.venv/bin/ng_run "+config_paths=[resources_servers/mission_search/configs/resources_only_bge_m3_top2_semantic.yaml]" +skip_venv_if_present=true
+# The log must show "[verify] semantic credit on (threshold 0.65, points 0.85)".
+mission_search_resources_server:
+  resources_servers:
+    mission_search:
+      entrypoint: app.py
+      domain: other
+      verified: false
+      retriever: bge_m3
+      top_k: 2
+      semantic_credit: true

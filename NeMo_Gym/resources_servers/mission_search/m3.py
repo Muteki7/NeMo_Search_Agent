@@ -83,6 +83,13 @@ class BGEM3:
                     colbert[i] = cv[b, :n_tok - 1].numpy()              # everything after [CLS]
         return np.stack(dense), sparse, colbert
 
+    def reference_coverage(self, reference: str, answer: str) -> float:
+        """ColBERT score with the REFERENCE as the query and the answer as the document: the mean over the reference tokens of the best
+        match among the answer tokens. A long correct answer is not punished for its extra words, an answer that leaves out part of
+        the reference is. Texts longer than DOC_MAX_LENGTH tokens are cut."""
+        _, _, vecs = self.encode([reference, answer], max_length=DOC_MAX_LENGTH)
+        return float(colbert_scores([vecs[0]], [vecs[1]])[0, 0])
+
 
 # ---------------------------------------------------------------------------------------------------------------
 # Scores for a batch of queries against all chunks (used by the benchmark; the lists are small there)

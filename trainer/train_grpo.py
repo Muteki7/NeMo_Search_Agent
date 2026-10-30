@@ -130,6 +130,7 @@ def main():
     ap.add_argument("--lora-rank", type=int, default=64)
     ap.add_argument("--batch", type=int, default=4, help="trajectories for one loss step (batch x accum must be a multiple of NUM_GEN)")
     ap.add_argument("--accum", type=int, default=2)
+    ap.add_argument("--train-split", default="train", help="the data file to train on: data/<split>.jsonl (run 3 uses train_dedup, see scripts/dedup_data.py)")
     ap.add_argument("--resume", type=Path, default=None,
                     help="a checkpoint-N folder: continue that run from step N, in the same run folder, with its saved settings")
     ap.add_argument("--force", action="store_true",
@@ -173,7 +174,7 @@ def main():
         print(f"[train] run folder: {run_dir}")
 
     model, tokenizer = load_model(args.model, args.gpu_util, args.lora_rank)
-    trainer = build_trainer(model, tokenizer, client, load_dataset("train"), max_steps=args.max_steps,
+    trainer = build_trainer(model, tokenizer, client, load_dataset(args.train_split), max_steps=args.max_steps,
                             output_dir=str(run_dir), save_steps=args.save_steps or None, batch=args.batch, accum=args.accum,
                             dump_path=str(run_dir / "train_dump.jsonl"), step_offset=resume_step)
     trainer.train(resume_from_checkpoint=str(resume_ckpt) if resume_ckpt else None)

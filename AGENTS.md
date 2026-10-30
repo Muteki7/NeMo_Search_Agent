@@ -41,10 +41,25 @@ The human owns design. The agent owns execution. When a decision is not on this 
 - Running the tests must leave the working tree clean. If it does not, report what it left.
 - Say what is NOT tested, and why.
 
-## Reporting (the predict → check loop)
-- Before every test run or live check, in the message before the command, write:
-  PREDICT: what I expect, and what result would prove me wrong.
-- After it, write:
-  RESULT: what happened. SURPRISE: yes/no, and why.
-- Every "yes" goes on the Surprises list in Plan.md (date, expected, got, next step). If it changes the plan, stop and tell me.
-- Say what was NOT tested. Failures and skips come first.
+## Reporting (predict → check, once per unit of work)
+Applies only to the verification run: the first full test run after a unit of
+work is code-complete, or a live check that supports a "done" claim. It does
+NOT apply to iterating, debugging, lint, typecheck, or re-runs after a fix.
+
+- Once the code is complete, before writing or running the tests, write:
+PREDICT: the behaviours I expect (max 5 bullets), and for each, what
+result would prove me wrong.
+- Write the tests from the prediction: one test per predicted behaviour,
+plus at least one that would fail if the prediction were wrong. Then run them.
+- After the run, write:
+RESULT: what happened. SURPRISE: yes/no, and why.
+- A surprise is a mismatch with PREDICT (the code behaved differently than I
+expected), not an ordinary failure from a typo or slip I fix straight away.
+- Never edit PREDICT after the run.
+- For every surprise:
+   - Add a test that covers it, if it captures behaviour worth guarding. If
+     not, say why no test was added.
+   - Log it on the Surprises list in Plan.md (date, expected, got, test
+     added or reason none, next step).
+   - If it changes the plan, stop and tell me.
+- Failures and skips come first in the report. Say what was NOT tested.

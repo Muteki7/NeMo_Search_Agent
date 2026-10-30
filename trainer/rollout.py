@@ -443,7 +443,7 @@ def build_response(output_items: list) -> dict:
 
 
 # The parts of the reward that /verify returns next to `reward` (the combined value the trainer uses).
-REWARD_PARTS = ("reward_answer", "reward_retrieval", "retrieval_gate", "best_cov", "n_searches")
+REWARD_PARTS = ("reward_answer", "reward_retrieval", "retrieval_gate", "best_cov", "n_searches", "reward_answer_semantic", "semantic_score")
 
 
 def verify_batch(client: GymClient, prompts, trajectory, answer, responses_create_params=None, max_workers: int = 16) -> list:

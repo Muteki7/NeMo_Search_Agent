@@ -12,6 +12,17 @@ NeMo_Gym/resources_servers/mission_search/m3_cache/
 
 # training runs: each checkpoint is about 1 GB
 trainer/runs/
+# the LoRA adapter folder of the trainer: rewritten on every run (the real adapters are in trainer/runs/)
+trainer/grpo_trainer_lora_model/
+# logs: keep only the training logs of run 2 (trainer/run2.log) and run 3 (trainer/run.log)
+trainer/*.log
+!trainer/run2.log
+!trainer/run.log
+
+# working notes, not for the repository
+SESSION_HANDOFF.md
+Setup.md
+Debug_checks.md
 
 # local model weights (BGE-M3 copy, 4 GB): never commit
 Embedder/

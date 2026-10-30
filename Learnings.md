@@ -718,6 +718,71 @@ The paired change of run 2 against run 1 is +0.039 ± 0.020. That is 1.9 standar
 
 **Where.** `m3.py`, `retriever.py`, `tests/test_retriever.py`, `tests/conftest.py`.
 
+### L23. Give credit for a correct answer in other words, but guard the numbers
+
+**Problem.** The verifier gives 1.0 only for an exact match or a short answer that contains the reference. The final model of run 2 scored 0.578 on 148 validation questions. We read 52 of the 79 answers that did not get 1.0. Of these, 26 were correct answers in other words (for example "35,560" against "35 560", or a long answer around a short reference). They scored 0.39 on average. A perfect verifier would give about 0.68.
+
+**Facts.**
+
+- A BGE-M3 score looks at the topic of two texts. It does not check a fact. We made 44 answers from correct answers by changing one number. In each mode, 73 to 95% of them stayed above the best threshold.
+- The ColBERT score is not symmetric. With the reference as the query, a long correct answer is not punished for its extra words. An answer that leaves out part of the reference is punished: only 5 of 39 half answers kept the credit. This direction had the smallest overlap between correct and wrong answers.
+- A guard that needs every number of the reference in the answer caught all 44 changed answers. It blocked 1 of 46 correct answers. A blocked answer keeps its old reward, so the cost is small. On real data, two wrong answers scored 0.60 and 0.61. The guard blocked both.
+- The labelled set had no hard negatives at first. We made them with a script, and they changed the design.
+- The guard sees digits only. A wrong answer without a number can still get credit (row 97 of the run-2 eval: score 0.66). Two answers that agree with a bad reference also got credit.
+
+**Solution.**
+
+- Credit rule: if the number guard passes and the ColBERT score (reference as the query) is at least 0.65, the answer reward is at least 0.85. The rule never lowers a reward. The model runs only when the cheap checks pass.
+- The points are below 1.0, so an exact answer still earns more than a long answer in other words.
+- `reward_answer` stays the answer reward of the old rules. The new field `reward_answer_semantic` holds the credited value, and `reward` uses it. The yardstick between runs (L17) does not change.
+- The server loads one BGE-M3 for the retriever and the verifier. The credit is off unless the config sets `semantic_credit: true`.
+- We replayed the 148 saved answers. The mean went from 0.578 to 0.677, and 30 answers got credit. None of the 9 wrong answers or 7 bad questions got credit. The threshold was chosen on the same 72 labels.
+
+**Rule.** A semantic score checks the topic, not the facts. Guard the facts that a rule can check. Test a new reward on hard negatives, not only on easy ones. Keep the old reward as a yardstick, because a rise of the new reward alone does not show that the model is better.
+
+**Where.** `app.py` (`number_guard`, `semantic_credit`), `m3.py` (`reference_coverage`), `scripts/rescore_dump.py --semantic`, `tests/test_semantic_credit.py`, `data/verifier_labels.jsonl`.
+
+### L24. Remove repeated questions, and drop the ones with conflicting references
+
+**Problem.** The same question text appears more than once in the data. Train has 110 extra rows (88 questions), validation has 18 (15 questions). The model sees the same question many times in training. In validation, 148 rows are not 148 independent samples, so the standard error is too small.
+
+**Facts.**
+
+- The generator built each question from a window of three chunks, and neighbouring windows overlap. Every repeat comes from neighbouring chunks (for example 99 and 100). None comes from the same chunk.
+- Most repeats have the same reference. Some have different references (22 questions in train, 4 in validation, after the verifier's `normalize`). We cannot know which reference is right. A correct answer can score low against the wrong one.
+- No question is in both train and validation.
+
+**Solution.**
+
+- Keep the first copy of a repeated question. Drop all copies when the references differ. Two references are the same when the verifier's `normalize` gives the same text.
+- Write new files (`train_dedup.jsonl`: 1,108 rows, `validation_dedup.jsonl`: 126 rows). Do not change the originals. The trainer loads a split by name.
+- Recompute old results on the 126 rows from the saved dumps. The means fell by about 0.01 and the standard errors grew by about 0.003. No conclusion changed.
+
+**Rule.** Compare the old and the new numbers on the same rows. Keep the original files, so an old result can still be reproduced.
+
+**Where.** `scripts/dedup_data.py`, `tests/test_dedup_data.py`, `data/*_dedup.jsonl`.
+
+### L25. A better verifier changed the score, not the model: compare like with like
+
+**Problem.** Run 3 trained with the BGE-M3 retriever, the semantic credit (L23) and the de-duplicated data (L24). We wanted to know if the model was better than run 2.
+
+**Facts.**
+
+- Eval on the 126 validation questions, greedy, both final models with BGE-M3 at top 2. Old rule: run 3 0.558, run 2 0.569 (run 3 minus run 2: -0.011 ± 0.019). With the credit: run 3 0.653, run 2 0.667 (-0.014 ± 0.022). Each run has 25 answers with credit. There is no difference.
+- The credit adds about 0.10 to both models. It changes the scale of the score, not the model.
+- The training reward rose from 0.43 to 0.71. This does not show a better model. The reward is not the same in the two runs (L15, L17).
+- One set of answers has three scores. `reward` in `eval_summary.json` is the old rule (the yardstick). `reward_answer_semantic` is the answer part with the credit. `reward_total` is the training formula: 0.75 times the credited answer plus 0.25 times the retrieval part.
+- Run 2 checkpoints were evaluated with the old retriever. Only its final model was evaluated again with BGE-M3. A step by step comparison mixes the retriever and the training. Only the comparison of the final models is fair.
+- The room was small. A perfect verifier gave about 0.68 on the labelled answers (L23), and the model already answers in words close to the reference. Bad references and bad questions limit the score too (L18).
+- The answers did not drift. Mean final words went from 46 to 35 in training, and the eval answers have 22 words (run 2: 22).
+- In the training dump, 2 of the 424 rows with credit had no search. The model wrote a bad tool call as text, and the text repeated the question words (ColBERT 0.675 and 0.709, reward 0.6375). We left this open on purpose (decision of the user, 2026-10-30).
+
+**Not known.** Run 3 changed three things at once, so we cannot say which one did nothing. There is one run for each setting. Nobody read the 25 answers with credit in the eval.
+
+**Rule.** Compare two runs with the same retriever, the same rule and the same rows. Write which of the three scores a number is. Before you train on a new reward, measure how much room it has (the labelled ceiling), because a verifier that fixes the scale may not change the model.
+
+**Where.** `trainer/runs/20261030-080054_run3_semantic`, `trainer/runs/eval_run3_semantic`, Plan step 6.
+
 ## 4. Procedures
 
 ### 4.1 Make the data files
@@ -811,7 +876,7 @@ For a fast check, add `--limit 60 --no-repair`.
 
 1. Go to the folder `NeMo_Gym/resources_servers/mission_search`.
 2. Run `(ulimit -v 25165824; .venv/bin/python -m pytest tests)`.
-3. Make sure that all tests pass (78 tests on 2026-10-29).
+3. Make sure that all tests pass (78 tests on 2026-10-29, 110 on 2026-10-30).
 4. To find a new limit, run the tests with a script that prints `VmPeak` and `VmHWM` from `/proc/self/status` at the end.
 5. Set the limit to 1.5 times `VmPeak`. It must stay below the RAM of WSL (31 GB).
 
@@ -826,7 +891,9 @@ For a fast check, add `--limit 60 --no-repair`.
 - Measure the length cap (5 x expected words + 15) on a larger dump. Look at the final answers that get 1.0 by containment.
 - The ramp of the retrieval part (0.3 to 0.6) fits NoInstruct at top 2. Fit it again for the new retriever, or drop the part (L16).
 - Run 2 changed two things. Run an ablation with the scaling change alone if the cause matters. One run costs about 1 hour, and the evaluation about 25 minutes.
-- Remove the repeated question rows from the data (L18). Decide whether git tracks `data/train.jsonl` and `data/validation.jsonl`. The scaffold ignores them, and git also ignores `Step2_Files`.
+- Decide whether git tracks `data/train.jsonl`, `data/validation.jsonl` and the new `*_dedup.jsonl` files. The scaffold ignores them, and git also ignores `Step2_Files`. (The repeated rows are removed in the `_dedup` files: L24.)
 - Put the path of BGE-M3 in a config value before the server loads it.
 - A `top_k` of 3 gives about 420 tokens for each search. Raise `MAX_COMPLETION` and `MAX_SEQ`, and check the VRAM. The peak was 19.9 GB of 24.4 GB.
 - Compact the WSL disk file when drive C is short on space (L21).
+- Read the 25 answers with credit in `eval_run3_semantic/eval_final.jsonl` and mark the wrong ones (L25). The credit has no check for a search: 2 of 424 credited training rows had none.
+- Run 2 checkpoints 50, 100 and 150 with BGE-M3 at top 2 (about 15 minutes of GPU) give a fair step by step table against run 3 (L25).

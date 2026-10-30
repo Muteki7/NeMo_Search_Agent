@@ -12,25 +12,36 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # so that `import app` finds ../app.py
-from app import score_answer  # noqa: E402
+SERVER_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(SERVER_DIR))   # so that `import app` finds ../app.py
+from app import score_answer, semantic_credit  # noqa: E402
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dump", type=Path)
     ap.add_argument("--show", type=int, default=10, help="how many trajectories to print in each list")
+    ap.add_argument("--semantic", action="store_true", help="also apply the semantic credit of app.py (loads BGE-M3 on the CPU: about 2.3 GB of memory)")
+    ap.add_argument("--m3-dir", type=Path, default=SERVER_DIR.parents[2] / "Embedder" / "bge-m3")
     args = ap.parse_args()
 
+    model = None
+    if args.semantic:
+        import m3
+        model = m3.BGEM3(args.m3_dir)
     rows = [json.loads(line) for line in args.dump.read_text(encoding="utf-8").splitlines() if line]
     for r in rows:
-        r["new_reward"] = score_answer(r["final_text"], r["answer"])
+        r["new_reward"], r["semantic_score"] = semantic_credit(score_answer(r["final_text"], r["answer"]), r["final_text"], r["answer"], model)
         # score_answer is the ANSWER-ONLY reward. A dump of run 2 or later also holds the combined reward in `reward`
         # and the answer part in `reward_answer`: compare with the answer part.
         r["reward"] = r.get("reward_answer", r["reward"])
 
     print(f"{len(rows)} trajectories from {args.dump}")
     print(f"mean reward: recorded {sum(r['reward'] for r in rows) / len(rows):.3f} -> now {sum(r['new_reward'] for r in rows) / len(rows):.3f}")
+    if model is not None:
+        scored = [r for r in rows if r["semantic_score"] is not None]
+        credited = [r for r in scored if r["new_reward"] > score_answer(r["final_text"], r["answer"])]
+        print(f"semantic credit: the model scored {len(scored)} answers (guard passed, reward below the credit points), {len(credited)} got credit")
 
     by_end = defaultdict(list)
     for r in rows:

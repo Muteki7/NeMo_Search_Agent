@@ -355,6 +355,36 @@ def test_reward_parts_reach_the_dump_and_the_trainer_gets_the_combined_reward():
     assert replies[0]["reward_answer"] == 0.5                               # eval reads the answer-only part from here
 
 
+# ---- 5e. the semantic credit fields (run 3) --------------------------------------------------------------------
+def dump_line_for(reply):
+    import os, tempfile
+
+    class FakeClient:
+        def post(self, path, body):
+            return reply
+
+    path = os.path.join(tempfile.mkdtemp(), "dump.jsonl")
+    out, _, _ = rollout_for({"Q": [("It is 1.", "stop")]})
+    rewards = make_gym_verify_reward(FakeClient(), dump_path=path)(
+        prompts=[messages("Q")], completions=[None], trajectory=out["trajectory"], answer=["1"])
+    return rewards, json.loads(open(path, encoding="utf-8").readline())
+
+
+def test_the_semantic_credit_fields_reach_the_dump_and_the_trainer_still_gets_the_combined_reward():
+    rewards, line = dump_line_for({"reward": 0.8875, "reward_answer": 0.3, "reward_answer_semantic": 0.85, "semantic_score": 0.7,
+                                   "reward_retrieval": 1.0, "retrieval_gate": 1.0, "best_cov": 1.0, "n_searches": 1.0})
+    assert rewards == [0.8875]
+    assert line["reward"] == 0.8875 and line["reward_answer"] == 0.3        # the yardstick part keeps the rules of run 1
+    assert line["reward_answer_semantic"] == 0.85 and line["semantic_score"] == 0.7
+
+
+def test_a_reply_from_a_server_without_the_semantic_credit_gives_a_dump_without_the_fields():
+    rewards, line = dump_line_for({"reward": 0.625, "reward_answer": 0.5, "reward_retrieval": 0.75, "retrieval_gate": 1.0,
+                                   "best_cov": 0.9, "n_searches": 1.0})
+    assert rewards == [0.625] and line["reward_answer"] == 0.5
+    assert "reward_answer_semantic" not in line and "semantic_score" not in line
+
+
 # ---- 6. live tests: need `ng_run` with resources_only.yaml -----------------------------------------------------
 def live_search_and_verify_end_to_end():
     client = GymClient.discover()
