@@ -71,9 +71,9 @@ class CorpusSearcher:
                  m3_model=None):
         from retriever import BGEM3Retriever, ChromaRetriever, load_chunks
 
-        if not chroma_dir.is_dir():
-            raise FileNotFoundError(f"Chroma index not found at {chroma_dir}. Build it with scripts/build_index.py.")
         if retriever == "chroma":
+            if not chroma_dir.is_dir():
+                raise FileNotFoundError(f"Chroma index not found at {chroma_dir}. Build it with scripts/build_index.py.")
             self.retriever = ChromaRetriever(chroma_dir, collection_name, embedding_model)
         elif retriever == "bge_m3":
             # The chunks come from the chunk store (written from the same index by scripts/export_chunks.py), so they do not change with the retriever.

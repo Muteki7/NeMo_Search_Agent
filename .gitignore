@@ -25,6 +25,7 @@ Setup.md
 Debug_checks.md
 rules.md
 ASD-STE100.jpeg
+Learning/
 
 # local model weights (BGE-M3 copy, 4 GB): never commit
 Embedder/

@@ -315,6 +315,25 @@ def test_corpus_searcher_gives_its_model_to_the_bge_m3_retriever(tmp_path, monke
     assert text.startswith("Result 1:\nbattery energy at landing\n------\n") and text.count("------\n") == 2 and model.calls
 
 
+def test_bge_m3_searcher_starts_and_searches_without_a_chroma_folder(tmp_path) -> None:
+    # A clean clone has no chroma_index: git ignores it, and build_index.py makes it from files that are not in the repository. The BGE-M3 path never reads it.
+    sys.path.insert(0, str(SERVER_DIR.parent))
+    from app import CorpusSearcher
+    chunk_store.write_chunks(tmp_path / "chunks.jsonl", mk_chunks(["engine cut off early", "battery energy at landing", "thermal control mode"]), {"chunking": {}})
+    searcher = CorpusSearcher(tmp_path / "no_such_index", "col", "unused", 2, retriever="bge_m3", m3_dir=fake_model_dir(tmp_path / "model"),
+                              m3_cache_dir=tmp_path / "cache", chunks_path=tmp_path / "chunks.jsonl", m3_model=FakeModel())
+    assert searcher.search("battery energy").startswith("Result 1:\nbattery energy at landing\n------\n")
+    assert not (tmp_path / "no_such_index").exists()                      # the searcher did not make the folder either
+
+
+def test_chroma_searcher_still_stops_with_the_build_command_when_the_folder_is_missing(tmp_path) -> None:
+    sys.path.insert(0, str(SERVER_DIR.parent))
+    from app import CorpusSearcher
+    with pytest.raises(FileNotFoundError, match="build_index.py"):
+        CorpusSearcher(tmp_path / "no_such_index", "col", "unused", 2, retriever="chroma")
+    assert not (tmp_path / "no_such_index").exists()
+
+
 def test_config_keeps_the_old_behaviour_by_default() -> None:
     sys.path.insert(0, str(SERVER_DIR.parent))
     from app import MissionSearchResourcesServerConfig

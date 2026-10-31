@@ -1,0 +1,8 @@
+# uv --override file for the trainer environment (use it with: uv pip install --override overrides.txt -r requirements.txt).
+# Unsloth 2026.9.12 declares trl<=0.24.0 and transformers<=5.5.0, but its own source already handles newer versions, and this project needs both:
+#   - TRL 0.24.0 has no rollout_func and no env_mask (they came in 0.25 and 0.28), and the trainer is built on them.
+#   - vLLM 0.24.0 refuses transformers 4 and wants transformers>=5.5.3.
+# The pins below replace Unsloth's declared limits. They were tested as far as run 3 and not by Unsloth, so a new Unsloth release can break them.
+# Background: docs/Dependency_hell.md, rows 24 and 25.
+trl==0.29.1
+transformers==5.17.0

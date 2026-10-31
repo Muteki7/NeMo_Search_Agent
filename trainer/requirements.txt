@@ -1,0 +1,45 @@
+# TRAINER environment: Unsloth + TRL + vLLM on one NVIDIA GPU (24 GB). Python 3.12, CUDA 12.8 wheels.
+# Tested on an RTX 5090 Laptop GPU (Blackwell), WSL2 Ubuntu, NVIDIA driver 592.00.
+#
+# This is NOT the server environment. The NeMo Gym resources server has its own environment and its own file:
+#   NeMo_Gym/resources_servers/mission_search/requirements.txt   (Python 3.13, CPU-only torch)
+# The two environments share no package. They talk over HTTP only. Never install one list into the other.
+#
+# Install from this folder. Always the whole list in ONE command, never one package alone (docs/Dependency_hell.md, section 2):
+#   uv venv .venv --python 3.12 --seed
+#   uv pip install --python .venv/bin/python --override overrides.txt -r requirements.txt
+# --override is needed: Unsloth 2026.9.12 declares trl<=0.24.0 and transformers<=5.5.0, which are stale (see overrides.txt).
+# Do not add --torch-backend or an extra index: with --torch-backend cu128 the resolver looks for torchao only on the PyTorch index and fails
+# (checked 2026-10-31). torch and torchvision are pinned by wheel URL instead, as in the server file, so they stay the CUDA 12.8 builds.
+# A plain torch==2.11.0 would resolve to the PyPI build, which pulls a different mix of CUDA packages.
+# After the install, `pip check` must report exactly two problems (unsloth wants trl and transformers below the pinned versions). Any other line is new.
+# Not needed on WSL2: the env var VLLM_WSL2_ENABLE_PIN_MEMORY=1. train_grpo.py sets it before vLLM loads.
+
+# --- core stack: every version is the one that trained run 3 (docs/Dependency_hell.md, section 1) ---
+unsloth==2026.9.12
+unsloth-zoo==2026.9.8
+trl==0.29.1
+transformers==5.17.0
+# vLLM comes from the GitHub release wheel (CUDA 12.9 build), not from PyPI. Keep the URL, or the resolver swaps in the PyPI build.
+vllm @ https://github.com/vllm-project/vllm/releases/download/v0.24.0/vllm-0.24.0+cu129-cp38-abi3-manylinux_2_28_x86_64.whl
+# torch and torchvision: CUDA 12.8 builds from the PyTorch index, pinned by URL (Linux x86_64, Python 3.12 only)
+torch @ https://download.pytorch.org/whl/cu128/torch-2.11.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl
+torchvision @ https://download.pytorch.org/whl/cu128/torchvision-0.26.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl
+# torchaudio: vLLM asks for it, and the PyPI build cannot load against the CUDA 12.8 torch (Unsloth then warns and turns it off)
+torchaudio @ https://download.pytorch.org/whl/cu128/torchaudio-2.11.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl
+torchao==0.18.0
+# xgrammar: vLLM accepts any 0.2.x. 0.2.5 declares transformers<5, which adds a third problem to `pip check`. 0.2.3 is the working stack.
+xgrammar==0.2.3
+peft==0.21.1
+bitsandbytes==0.50.2
+triton==3.6.0
+xformers==0.0.35
+datasets==3.6.0
+fsspec==2025.3.0
+huggingface-hub==1.33.0
+tokenizers==0.23.2
+
+# --- imported by our own scripts (rollout.py, eval.py) ---
+requests==2.34.2
+pyyaml==6.0.3
+safetensors==0.8.0
