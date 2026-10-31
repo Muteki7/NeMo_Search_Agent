@@ -136,19 +136,6 @@ uv pip install --python .venv/bin/python --override overrides.txt -r requirement
 
 After the install, `pip check` must report exactly two problems: `unsloth` wants an older `trl` and an older `transformers`. Any other line is new.
 
-### What was checked
-
-The checks below ran on 2026-10-31 on the author's machine, unless a date says otherwise.
-
-| Part | Checked | Not checked |
-|---|---|---|
-| Server environment | Built from its file on 2026-10-05. `uv pip install --dry-run` from the server folder reports no changes. | An install from the file into an empty environment since then. |
-| BGE-M3 download | The file names and sizes of the command match the Hugging Face Hub (`hf download --dry-run`) and the author's local copy. | The download itself. |
-| Trainer environment | The file was installed into an empty environment (about 4 minutes with downloads, 2.8 GB of new disk). `pip check` showed exactly the two problems above. `torch` is `2.11.0+cu128` and sees the GPU, all 17 `==` pins match, and the 26 offline trainer tests pass. `trainer/spike_rollout_func.py` (two GRPO steps on a 1B model, vLLM on the same GPU) passed all 19 checks in 3 minutes. | A full training run on this environment. About 70 packages that the file does not pin (for example pydantic, starlette, pillow) resolve to newer versions than in the environment that trained run 3. |
-| Server start | `ng_run` with the run 3 config and no `chroma_index` folder reached `All 1 / 1 servers ready`, answered `/search_corpus` and `/verify`, and stopped without leaving a process. | Training against that server after the last change to `app.py`. |
-
-Nobody has run the whole path from a clean clone, start to finish.
-
 ## Run it
 
 Use two terminals. Start the server first and leave it running.
