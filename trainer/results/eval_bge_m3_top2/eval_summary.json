@@ -1,0 +1,48 @@
+[
+  {
+    "model": "base",
+    "n": 148,
+    "reward": 0.20565648712141782,
+    "reward_se": 0.027844271330236085,
+    "exact": 0.12837837837837837,
+    "contains": 0.20270270270270271,
+    "tool_call_rate": 0.9932432432432432,
+    "answer_rate": 0.972972972972973,
+    "mean_turns": 2.5675675675675675,
+    "mean_final_words": 18.533783783783782,
+    "retrieved": 0.8378378378378378,
+    "retrieval_score": 0.8778232013526132,
+    "reward_total": 0.36919366117471214,
+    "endings": {
+      "answer": 0.972972972972973,
+      "truncated": 0.0,
+      "bad_call": 0.006756756756756757,
+      "turn_cap": 0.006756756756756757,
+      "budget": 0.013513513513513514
+    }
+  },
+  {
+    "model": "final",
+    "n": 148,
+    "reward": 0.578417634041802,
+    "reward_se": 0.03485283029027065,
+    "exact": 0.46621621621621623,
+    "contains": 0.4864864864864865,
+    "tool_call_rate": 1.0,
+    "answer_rate": 1.0,
+    "mean_turns": 2.0,
+    "mean_final_words": 22.12162162162162,
+    "retrieved": 0.8378378378378378,
+    "retrieval_score": 0.8845799581093698,
+    "reward_total": 0.6549582150586939,
+    "endings": {
+      "answer": 1.0,
+      "truncated": 0.0,
+      "bad_call": 0.0,
+      "turn_cap": 0.0,
+      "budget": 0.0
+    },
+    "delta_reward_vs_base": 0.37276114692038415,
+    "delta_reward_se": 0.0365720537956228
+  }
+]

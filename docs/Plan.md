@@ -46,10 +46,11 @@ NeMo_search_agent/                         # the repository
     ├── eval.py           # base model and checkpoints on the validation set (greedy)
     ├── rollout_smoke.py  # test 2: the rollout alone on vLLM and the live server
     ├── test_rollout.py   # test 1: 24 CPU tests with a fake model and a fake tool
-    ├── plot_results.py   # draws ../docs/results.svg (base, run 2, run 3 on the 126 questions + training curves) from trainer/runs; standard library only
-    ├── test_plot_results.py    # 15 CPU tests for plot_results.py (hand-computed numbers; real-data tests skip without trainer/runs)
+    ├── plot_results.py   # draws ../docs/results.svg (base, run 2, run 3 on the 126 questions + training curves) from trainer/results; standard library only
+    ├── test_plot_results.py    # 16 CPU tests for plot_results.py (hand-computed numbers; real-data tests skip without trainer/results, and one test fails then)
     ├── prompting.py      # renders chat prompts with the template date pinned (26 Jul 2024); all render sites must use it
     ├── spike_rollout_func.py   # Gate 1 spike (passed)
+    ├── results/<run or eval folder>/   # tracked copies (about 10 MB) of the dumps that plot_results.py reads: eval_*.jsonl, eval_summary.json, train_dump.jsonl, run_config.json
     └── runs/<start time>_<name>/   # run_config.json, train_dump.jsonl, checkpoint-N/, final/, eval_*.jsonl, report.html (git-ignored)
 ```
 

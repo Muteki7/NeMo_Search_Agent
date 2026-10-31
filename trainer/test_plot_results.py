@@ -1,7 +1,7 @@
 """Why this file exists: plot_results.py draws docs/results.svg, the chart that shows the result of the project. A wrong window, a repeated
 question counted twice or a hard-coded sentence would put a false number or a false claim into the README without any error. The synthetic
 tests check each calculation against numbers worked out by hand. The real-data tests check the chart numbers against the eval summaries
-(they skip when trainer/runs/ is missing: it is git-ignored). No GPU, no server, standard library only.
+(they skip when trainer/results/ is missing, and then test_every_file_the_chart_reads_is_in_trainer_results fails, so a skip cannot hide it). No GPU, no server, standard library only.
 
 Run (from the trainer folder, any Python 3):
     python3 test_plot_results.py
@@ -107,20 +107,26 @@ def test_the_svg_root_has_the_box_as_view_box_and_its_points_are_x_y_pairs():
     assert "," not in re.sub(r"[\d.]+,[\d.]+", "", " ".join(el.attrib.get("points", "") for el in root.iter()))   # points are x,y pairs only
 
 
-# ---- real data (skipped when the runs folder is missing) ---------------------------------------------------------------------------
+# ---- real data (skipped when trainer/results/ is missing) --------------------------------------------------------------------------
 def _real_or_skip():
     needed = list(pr.EVALS.values()) + list(pr.TRAIN_DUMPS.values()) + [pr.VALIDATION]
     if not all(p.exists() for p in needed):
-        print("      (skipped: trainer/runs/ or the validation file is missing)")
+        print("      (skipped: trainer/results/ or the validation file is missing)")
         return None
     return pr.collect()
+
+
+def test_every_file_the_chart_reads_is_in_trainer_results():
+    needed = list(pr.EVALS.values()) + list(pr.TRAIN_DUMPS.values()) + [pr.VALIDATION, pr.RESULTS / "eval_run3_semantic" / "eval_summary.json"]
+    missing = [str(p.relative_to(pr.REPO_ROOT)) for p in needed if not p.exists()]
+    assert not missing, f"the chart needs these files and they are not in the repository: {missing}"
 
 
 def test_real_bars_match_the_eval_summaries_on_126_questions():
     data = _real_or_skip()
     if data is None:
         return
-    summary = {m["model"]: m for m in json.loads((pr.RUNS / "eval_run3_semantic" / "eval_summary.json").read_text())}
+    summary = {m["model"]: m for m in json.loads((pr.RESULTS / "eval_run3_semantic" / "eval_summary.json").read_text())}
     assert data["n"] == 126
     assert math.isclose(data["bars"]["base"][0], summary["base"]["reward"], abs_tol=1e-6)
     assert math.isclose(data["bars"]["run3"][0], summary["final"]["reward"], abs_tol=1e-6)

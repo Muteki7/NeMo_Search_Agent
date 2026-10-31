@@ -22,7 +22,7 @@ Held-out questions: 126, greedy decoding, BGE-M3 retriever with the top 2 chunks
 - **The semantic credit changes the score, not the model.** It adds about 0.10 to both models (run 2: 0.667, run 3: 0.653 with credit).
 - **Limits.** One training run for each setting, so there is no seed variance. The questions and reference answers were written by an 8B model and nobody checked them all. In a hand check of 52 answers, 15 had a bad reference or a bad question. A perfect verifier would score about 0.68 on the labelled answers.
 
-The numbers come from `trainer/runs/` (not in this repository, see [What you can reproduce](#what-you-can-reproduce)). `trainer/plot_results.py` draws the chart from them.
+The numbers come from the eval and training dumps in [trainer/results/](trainer/results/) (about 10 MB, in this repository). `cd trainer && python3 plot_results.py` draws the chart from them.
 
 ## How it works
 
@@ -193,7 +193,7 @@ All tests run on the CPU. The trainer tests use a fake model and a fake tool.
 |---|---|---|
 | Server (118) | `cd NeMo_Gym/resources_servers/mission_search && (ulimit -v 25165824; .venv/bin/python -m pytest tests)` | 118 passed in 32 s, 2.6 GB resident |
 | Trainer rollout (26) | `cd trainer && .venv/bin/python test_rollout.py` | 26 of 26 passed |
-| Chart (15) | `cd trainer && python3 test_plot_results.py` | 15 of 15 passed |
+| Chart (16) | `cd trainer && python3 test_plot_results.py` | 16 of 16 passed |
 
 The `ulimit -v` cap protects the machine: the BGE-M3 tests are memory-heavy. Tests that need `Embedder/bge-m3`, the Chroma index, `data/train.jsonl` or the run folders skip themselves. With only the tracked files and the server environment, 105 pass and 13 skip (checked on a copy of the tracked files, 2026-10-31). Not covered by this table: `eval.py` on the GPU, the server under `ng_run` with 16 parallel verifies, and training quality. Two scripts need the GPU: `trainer/spike_rollout_func.py` (passed on 2026-10-31, see above) and `trainer/rollout_smoke.py` (the rollout on the real engine and a live server; not re-run on 2026-10-31).
 
@@ -224,6 +224,7 @@ NeMo_search_agent/
     ├── eval.py                 base model and checkpoints on the validation questions
     ├── prompting.py            chat prompts with the template date pinned
     ├── plot_results.py         draws docs/results.svg
+    ├── results/                the eval and training dumps behind the chart (9 files, about 10 MB; copies from the git-ignored runs/)
     ├── test_rollout.py, test_plot_results.py, rollout_smoke.py, spike_rollout_func.py
     ├── requirements.txt, overrides.txt     the trainer environment
     └── run2.log, run.log       the training logs of run 2 and run 3
@@ -234,10 +235,11 @@ NeMo_search_agent/
 | You want to | What you need | Is it in the repository? |
 |---|---|---|
 | Train run 3 again, or evaluate a model | The Gym clone (Set up, step 1), the BGE-M3 weights (step 3) and the trainer environment | Yes, apart from those two downloads. `data/` holds the finished chunks (`chunks.jsonl`) and questions (`train_dedup.jsonl`, `validation_dedup.jsonl`). |
-| Get the numbers and the chart above again | `trainer/runs/`: checkpoints (about 1 GB each) and the training and eval dumps | No. You get your own when you train. |
+| Check the numbers and redraw the chart above | `trainer/results/`: the eval and training dumps (about 10 MB) | Yes. `cd trainer && python3 plot_results.py` |
+| Use the trained models | The LoRA adapters (about 640 MB each) | No, they are not published. You get your own when you train. |
 | Repeat run 1 or run 2 | `Step2_Files/` (git-ignored): the report, AutoDidact's `chunks.pkl` and `questions.json`. They build `data/train.jsonl` (`scripts/convert_questions.py`) and the Chroma index (`scripts/build_index.py`). | No. |
 
-The trained LoRA adapters are not published. `chroma_index/` (built by `scripts/build_index.py`) and `m3_cache/` (builds itself on the first server start) sit in the server folder and are git-ignored.
+`chroma_index/` (built by `scripts/build_index.py`) and `m3_cache/` (builds itself on the first server start) sit in the server folder and are git-ignored.
 
 ## The docs
 

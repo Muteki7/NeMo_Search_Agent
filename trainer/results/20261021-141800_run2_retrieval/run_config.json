@@ -1,0 +1,34 @@
+{
+  "args": {
+    "model": "unsloth/Meta-Llama-3.1-8B-Instruct",
+    "max_steps": 200,
+    "save_steps": 50,
+    "name": "run2_retrieval",
+    "gpu_util": 0.55,
+    "lora_rank": 64,
+    "batch": 4,
+    "accum": 2
+  },
+  "hyperparameters": {
+    "learning_rate": 5e-06,
+    "adam_beta1": 0.9,
+    "adam_beta2": 0.99,
+    "weight_decay": 0.1,
+    "warmup_steps": 0.1,
+    "lr_scheduler_type": "cosine",
+    "optim": "paged_adamw_8bit",
+    "max_grad_norm": 0.1,
+    "beta": 0.0,
+    "scale_rewards": "none"
+  },
+  "constants": {
+    "NUM_GEN": 8,
+    "MAX_TURNS": 5,
+    "MAX_NEW": 512,
+    "MAX_SEQ": 4096,
+    "MAX_COMPLETION": 3000,
+    "TEMPERATURE": 0.9,
+    "TOP_P": 0.95
+  },
+  "server": "http://127.0.0.1:15839"
+}

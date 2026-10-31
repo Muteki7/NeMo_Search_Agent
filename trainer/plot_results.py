@@ -1,7 +1,8 @@
 """Draw docs/results.svg: the base model, run 2 and run 3 on the held-out questions, and the training curves of run 2 and run 3.
 
 The chart is plain SVG written with the standard library (no plotting package, GitHub shows it in the README). It reads the eval and
-train dumps in trainer/runs/ (git-ignored), so only the finished SVG is committed. Every number in it is computed from the dumps.
+train dumps in trainer/results/ (tracked copies of files from trainer/runs/, which is git-ignored: its checkpoints are about 1 GB each).
+Every number in it is computed from the dumps.
 
 Run (from the trainer folder, any Python 3):
     python3 plot_results.py            # writes ../docs/results.svg
@@ -19,18 +20,18 @@ from xml.sax.saxutils import escape
 
 TRAINER_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TRAINER_DIR.parent
-RUNS = TRAINER_DIR / "runs"
+RESULTS = TRAINER_DIR / "results"
 VALIDATION = REPO_ROOT / "NeMo_Gym" / "resources_servers" / "mission_search" / "data" / "validation_dedup.jsonl"
 OUT = REPO_ROOT / "docs" / "results.svg"
 
 EVALS = {   # the three models, all evaluated with BGE-M3 at top 2 (the base comes from the run-3 eval session)
-    "base": RUNS / "eval_run3_semantic" / "eval_base.jsonl",
-    "run2": RUNS / "eval_bge_m3_top2" / "eval_final.jsonl",
-    "run3": RUNS / "eval_run3_semantic" / "eval_final.jsonl",
+    "base": RESULTS / "eval_run3_semantic" / "eval_base.jsonl",
+    "run2": RESULTS / "eval_bge_m3_top2" / "eval_final.jsonl",
+    "run3": RESULTS / "eval_run3_semantic" / "eval_final.jsonl",
 }
 TRAIN_DUMPS = {
-    "run2": RUNS / "20261021-141800_run2_retrieval" / "train_dump.jsonl",
-    "run3": RUNS / "20261030-080054_run3_semantic" / "train_dump.jsonl",
+    "run2": RESULTS / "20261021-141800_run2_retrieval" / "train_dump.jsonl",
+    "run3": RESULTS / "20261030-080054_run3_semantic" / "train_dump.jsonl",
 }
 FIELD = "reward_answer"        # the old rule: the yardstick of Learnings L17
 WINDOW = 25                    # training steps in one point of a curve
