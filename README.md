@@ -22,7 +22,7 @@ Held-out questions: 126, greedy decoding, BGE-M3 retriever with the top 2 chunks
 - **The semantic credit changes the score, not the model.** It adds about 0.10 to both models (run 2: 0.667, run 3: 0.653 with credit).
 - **Limits.** One training run for each setting, so there is no seed variance. The questions and reference answers were written by an 8B model and nobody checked them all. In a hand check of 52 answers, 15 had a bad reference or a bad question. A perfect verifier would score about 0.68 on the labelled answers.
 
-The numbers come from `trainer/runs/` (not in this repository, see [What is not in the repository](#what-is-not-in-the-repository)). `trainer/plot_results.py` draws the chart from them.
+The numbers come from `trainer/runs/` (not in this repository, see [What you can reproduce](#what-you-can-reproduce)). `trainer/plot_results.py` draws the chart from them.
 
 ## How it works
 
@@ -54,7 +54,19 @@ The numbers come from `trainer/runs/` (not in this repository, see [What is not 
 | 2 | NoInstruct + Chroma | answer + retrieval | `train` (1,240 rows) | `resources_only.yaml` |
 | 3 | BGE-M3 hybrid | answer + retrieval + semantic credit | `train_dedup` (1,108 rows) | `resources_only_bge_m3_top2_semantic.yaml` |
 
-This repository holds the code of run 3. Runs 1 and 2 need files that are not here (see below).
+This repository holds the code of run 3. Runs 1 and 2 need files that are not here (see [What you can reproduce](#what-you-can-reproduce)).
+
+## Where the chunks come from
+
+The agent searches 510 chunks of NASA's Apollo 13 Mission Report. The finished chunks are in `NeMo_Gym/resources_servers/mission_search/data/chunks.jsonl`. They were made in three steps:
+
+1. **Split (not in this repository).** AutoDidact's `generate_data.py` loads the report as a markdown file (`UnstructuredLoader`) and splits it with `RecursiveCharacterTextSplitter` (1,000 characters, no overlap). Result: 753 chunks, saved as `chunks.pkl`. This project did not change that step. How the PDF was turned into markdown is not recorded here.
+2. **Merge.** `scripts/build_index.py` glues every chunk of fewer than 100 characters onto the chunk after it, never above 1,500 characters. The splitter had cut each heading, page ID and caption on its own, so 206 of the 753 chunks had fewer than 50 characters. Result: 510 chunks of 101 to 1,089 characters. The same script builds the Chroma index that runs 1 and 2 used.
+3. **Export.** `scripts/export_chunks.py` reads the merged chunks out of that index and writes `data/chunks.jsonl`. This is the only chunk file that run 3 reads, so repeating run 3 needs neither step 1 nor step 2.
+
+The threshold of 100 characters was chosen by comparing five variants on all 1,434 questions: 100 gave the best answer coverage in the top 2 results (75.0%, against 72.0% with no merge). [docs/Plan.md](docs/Plan.md) has the comparison.
+
+Each chunk in `chunks.jsonl` also keeps `start` and `end`, the positions in the old 753-chunk list that it covers. The questions in `data/` point at those old positions, and the retrieval check uses the ranges. Do not split the report again: different cuts would break the link between the questions and their chunks.
 
 ## Two environments
 
@@ -217,17 +229,15 @@ NeMo_search_agent/
     └── run2.log, run.log       the training logs of run 2 and run 3
 ```
 
-## What is not in the repository
+## What you can reproduce
 
-| Missing | What it is | What you need it for |
+| You want to | What you need | Is it in the repository? |
 |---|---|---|
-| `NeMo_Gym/Gym/` | The NeMo Gym clone | Set up, step 1 |
-| `Embedder/bge-m3/` | BGE-M3 weights | Set up, step 3 |
-| `trainer/runs/` | Checkpoints (about 1 GB each), training and eval dumps | The chart and the numbers above. You get your own when you train. |
-| `Step2_Files/` | The source report, `chunks.pkl` and `questions.json` (the question and chunk files this project started from) | Rebuilding the data (`scripts/convert_questions.py`), the Chroma index (`scripts/build_index.py`) and so runs 1 and 2 |
-| `NeMo_Gym/resources_servers/mission_search/chroma_index/`, `m3_cache/` | Built from the files above | The old retriever; `m3_cache/` builds itself on the first start |
+| Train run 3 again, or evaluate a model | The Gym clone (Set up, step 1), the BGE-M3 weights (step 3) and the trainer environment | Yes, apart from those two downloads. `data/` holds the finished chunks (`chunks.jsonl`) and questions (`train_dedup.jsonl`, `validation_dedup.jsonl`). |
+| Get the numbers and the chart above again | `trainer/runs/`: checkpoints (about 1 GB each) and the training and eval dumps | No. You get your own when you train. |
+| Repeat run 1 or run 2 | `Step2_Files/` (git-ignored): the report, AutoDidact's `chunks.pkl` and `questions.json`. They build `data/train.jsonl` (`scripts/convert_questions.py`) and the Chroma index (`scripts/build_index.py`). | No. |
 
-The trained LoRA adapters are not published. The questions and answers in `data/` are the finished files, so run 3 can be repeated from the repository alone. Run 1 and run 2 cannot.
+The trained LoRA adapters are not published. `chroma_index/` (built by `scripts/build_index.py`) and `m3_cache/` (builds itself on the first server start) sit in the server folder and are git-ignored.
 
 ## The docs
 
