@@ -39,3 +39,10 @@ __pycache__/
 #Learning files
 Schema_learning/
 
+
+# generated or leftover files
+unsloth_compiled_cache/
+/grpo_trainer_lora_model/
+trainer/dryrun.txt
+trainer/=0.29.1
+trainer/train_dump.jsonl
